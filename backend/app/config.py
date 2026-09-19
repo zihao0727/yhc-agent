@@ -1,0 +1,31 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[1] / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+    database_url: str = "postgresql+psycopg://firefly_pricing_app:CHANGE_ME@127.0.0.1:5432/firefly_pricing"
+    admin_token: str = ""
+    allowed_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    storage_dir: Path = Path(__file__).resolve().parents[2] / ".runtime" / "customer-files"
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-flash"
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_timeout: int = 120
+    max_upload_bytes: int = 20 * 1024 * 1024
+    max_job_pages: int = 20
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_prefix: str = "firefly:agent"
+    agent_background: bool = True
+    agent_retry_seconds: int = 30
+
+
+@lru_cache
+def settings() -> Settings:
+    return Settings()
