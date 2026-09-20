@@ -47,7 +47,7 @@ def save_checkpoint(db, job, run):
     values = {"metadata": json.dumps(metadata, ensure_ascii=False)}
     values.update({f"line:{line['line_id']}": json.dumps(line, ensure_ascii=False) for line in lines})
     # Version-specific snapshots cannot overwrite a newer human edit.
-    key = f"{checkpoint_key(job.id)}:revision:{job.revision}"
+    key = f"{checkpoint_key(job.id)}:revision:{job.revision}:run:{run.id}"
     with redis_client().pipeline(transaction=True) as pipeline:
         pipeline.hset(key, mapping=values)
         pipeline.eval(PUBLISH, 2, checkpoint_key(job.id), key, job.revision, run.id)

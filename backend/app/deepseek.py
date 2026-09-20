@@ -149,8 +149,15 @@ def agent_turn(messages, tools):
                 json={"model": config.deepseek_model, "messages": messages, "tools": tools,
                       "tool_choice": "auto", "thinking": {"type": "disabled"}, "max_tokens": 4000})
         response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise ModelFailure(
+            "模型服务拒绝请求，请检查密钥、余额或配置" if code in (400, 401, 402, 403, 404, 422)
+            else "模型服务暂时不可用",
+            diagnostics={"status_code": code, "retryable": code == 429 or code >= 500},
+        ) from exc
     except httpx.HTTPError as exc:
-        raise ModelFailure("Agent 模型调用失败，请检查密钥、余额或网络后重试") from exc
+        raise ModelFailure("模型连接超时或网络异常", diagnostics={"retryable": True}) from exc
     try:
         body = response.json()
     except ValueError as exc:
@@ -280,7 +287,8 @@ file_id、page、text及source="image"；value和unit保留标注数值与单位
             messages_by_status = {401: "DeepSeek API Key 无效", 402: "DeepSeek 账户余额不足",
                                   429: "DeepSeek 请求限流，请稍后手动重试", 400: "DeepSeek 拒绝请求，请检查模型是否支持视觉"}
             raise ModelFailure(messages_by_status.get(code, f"DeepSeek 服务异常（{code}）"), attempt, usage,
-                               {"stage": "request", "http_status": code}) from exc
+                               {"stage": "request", "http_status": code,
+                                "retryable": code == 429 or code >= 500}) from exc
         except httpx.RequestError as exc:
             raise ModelFailure("DeepSeek 连接超时或网络异常，可稍后手动重试", attempt, usage,
                                {"stage": "request", "reason": "network_error"}) from exc

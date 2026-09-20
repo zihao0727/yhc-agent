@@ -75,9 +75,16 @@ export type Job = {
   runs: { id: number; status: string; model: string; attempts: number; error: string; created_at: string; usage: Record<string, number> }[]
   quotes: Quote[]
   agent_runs: {
-    id: number; status: string; message: string; created_at: string; usage: Record<string, number>
+    id: number; status: string; message: string; created_at: string
+    phase?: string; step_count?: number; active_product?: string
+    usage: { [key: string]: unknown; total_tokens?: number; retry_at?: number;
+      durable?: boolean; phase?: string; last_progress_at?: number; last_event_at?: number }
     steps: { tool: string; arguments: Record<string, unknown>; result: Record<string, unknown>; at: string }[]
   }[]
+}
+export type JobProgress = Pick<Job, 'id' | 'revision' | 'status' | 'pricing_progress'> & {
+  server_time: number
+  run: (Job['agent_runs'][number] & { offset: number }) | null
 }
 export const jobLabels: Record<string, string> = {
   uploaded: '待整理', processing: '执行中', needs_review: '待确认', ready: '需求已确认', failed: '已中断', quoted: '报价待审核',

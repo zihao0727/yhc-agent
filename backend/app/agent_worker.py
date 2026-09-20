@@ -20,6 +20,7 @@ def run_pending_once(stop):
     from .agent_loop import run_agent
     with SessionLocal() as db:
         runs = list(db.scalars(select(AgentRun).where(AgentRun.status == "processing").order_by(AgentRun.id)))
+        runs.sort(key=lambda run: (run.usage.get("last_scheduled_at", 0), run.id))
         for run in runs:
             if stop.is_set():
                 return
@@ -56,6 +57,10 @@ def run_pending_once(stop):
                 except Exception:
                     return True
             try:
+                from .agent_loop import locked
+                job, run = locked(db, job.id, run.id)
+                run.usage = {**run.usage, "last_scheduled_at": time.time()}
+                db.commit()
                 # Redis may have missed a write during shutdown. Restore from
                 # committed SQL, never the other way around.
                 save_checkpoint(db, job, run)

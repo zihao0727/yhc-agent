@@ -3,16 +3,26 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, ArrowRight, Check, ChevronLeft, ChevronRight, Download, FileImage, FileText, KeyRound, Link, Pencil, Plus, RefreshCw, Save, Search, Sparkles, Trash2, Upload, X } from 'lucide-vue-next'
 import { api, apiBlob, languageLabels, statusLabels, unitLabels, type Price, type Rule } from './api'
-import { jobLabels, quoteDisplayTotal, type CustomerFile, type Job, type Line, type Quote } from './requirements-types'
+import { jobLabels, quoteDisplayTotal, type CustomerFile, type Job, type JobProgress, type Line, type Quote } from './requirements-types'
 import QuoteChat from './QuoteChat.vue'
 import QuotePricingDetails from './QuotePricingDetails.vue'
 import QuoteConfirmations from './QuoteConfirmations.vue'
 import EstimateReviewList from './EstimateReviewList.vue'
 import EstimateEditor from './EstimateEditor.vue'
+import QuoteVersionDiff from './QuoteVersionDiff.vue'
+import AgentStepDetails from './AgentStepDetails.vue'
 import { shouldResumeConversation } from './agent-intent'
 
 const chat = ref<InstanceType<typeof QuoteChat>>()
 const detailsOpen = ref(false)
+type ProposedChange = { line_id: string; field: keyof Line; value: string | null; reason: string }
+const proposal = ref<{ jobId: number; revision: number; changes: ProposedChange[] } | null>(null)
+const proposalOpen = ref(false)
+const fieldLabels: Record<string, string> = {
+  quantity: '数量', width_mm: '宽度 (mm)', height_mm: '高度 (mm)', depth_mm: '深度 (mm)',
+  thickness_mm: '厚度 (mm)', billing_length_mm: '计价长度 (mm)', material: '材质',
+  process: '工艺', language: '语言', product: '项目名称', pricing_category: '报价类别', text_content: '文字内容',
+}
 const jobs = ref<Job[]>([])
 const job = ref<Job | null>(null)
 const total = ref(0)
@@ -58,6 +68,7 @@ const quoteOpen = ref(false)
 const terms = ref('')
 const selectedQuoteId = ref<number | null>(null)
 const selectedQuote = computed(() => job.value?.quotes.find(q => q.id === selectedQuoteId.value) || job.value?.quotes[0])
+const previousQuote = computed(() => job.value?.quotes.find(quote => quote.version < (selectedQuote.value?.version || 0)))
 const approvalOpen = ref(false)
 const approvalNote = ref('')
 const approvalTerms = ref('')
@@ -72,6 +83,49 @@ const detailTab = ref('requirements')
 let previewSequence = 0
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let disposed = false
+let polling = false
+let navigationSequence = 0
+let listSequence = 0
+let pollController: AbortController | undefined
+function invalidateRequests() {
+  navigationSequence++
+  pollController?.abort()
+}
+function discardProposal() { proposal.value = null; proposalOpen.value = false }
+async function pollProgress() {
+  if (polling || busy.value || !job.value || job.value.status !== 'processing' || disposed) return
+  polling = true
+  const id = job.value.id
+  const sequence = navigationSequence
+  const run = job.value.agent_runs[0]
+  const controller = new AbortController()
+  pollController = controller
+  try {
+    const progress = await api<JobProgress>(`/jobs/${id}/progress?run_id=${run?.id || 0}&after=${run?.steps.length || 0}`,
+      { signal: controller.signal })
+    if (disposed || sequence !== navigationSequence || job.value?.id !== id || busy.value) return
+    if (progress.revision < job.value.revision) return
+    if (progress.status !== 'processing') {
+      const current = await api<Job>(`/jobs/${id}`, { signal: controller.signal })
+      if (!disposed && sequence === navigationSequence && job.value?.id === id && !busy.value) {
+        job.value = current
+        await refreshList()
+      }
+      return
+    }
+    // Keep the complete document revision until a full reload; only progress is incremental.
+    job.value.pricing_progress = progress.pricing_progress
+    if (progress.run) {
+      const incoming = progress.run
+      const previous = job.value.agent_runs.find(item => item.id === incoming.id)
+      const merged = { ...incoming, steps: [...(previous?.steps.slice(0, incoming.offset) || []), ...incoming.steps] }
+      job.value.agent_runs = [merged, ...job.value.agent_runs.filter(item => item.id !== incoming.id)]
+    }
+    error.value = ''
+  } catch (e) {
+    if (!controller.signal.aborted && sequence === navigationSequence) error.value = `进度连接中断，正在重试：${err(e)}`
+  } finally { polling = false }
+}
 const money = (value: string | null) => value === null ? '—' : Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const date = (value: string) => new Date(value).toLocaleString('zh-CN', { hour12: false })
 const err = (e: unknown) => e instanceof Error ? e.message : '操作失败'
@@ -84,33 +138,54 @@ const newLine = (): Line => ({
 async function refresh() {
   loading.value = true; error.value = ''
   const id = job.value?.id
+  const sequence = navigationSequence
   try {
     config.value = await api('/model-config')
     pricingProducts.value = (await api<{ products: typeof pricingProducts.value }>('/options')).products
     if (id) {
       const current = await api<Job>(`/jobs/${id}`)
-      if (job.value?.id === id && current.revision >= job.value.revision) job.value = current
+      if (sequence === navigationSequence && job.value?.id === id && current.revision >= job.value.revision) job.value = current
     }
     await refreshList()
   } catch (e) { error.value = err(e) }
   finally { loading.value = false }
 }
 async function refreshList() {
+  const sequence = ++listSequence
   const result = await api<{ items: Job[]; total: number }>(`/jobs?page=${page.value}&q=${encodeURIComponent(query.value)}`)
+  if (disposed || sequence !== listSequence) return
   jobs.value = result.items; total.value = result.total
 }
 function openDetails(tab: string) {
   if (tab === 'review') { reviewOpen.value = true; return }
   detailTab.value = tab; detailsOpen.value = true
 }
-function newConversation() { job.value = null; error.value = ''; detailsOpen.value = false; reviewOpen.value = false; selectedQuoteId.value = null }
+function newConversation() { invalidateRequests(); discardProposal(); job.value = null; error.value = ''; detailsOpen.value = false; reviewOpen.value = false; selectedQuoteId.value = null }
 async function sendChat(payload: { text: string; files: File[] }) {
   if (busy.value || job.value?.status === 'processing') return
+  invalidateRequests()
+  discardProposal()
   busy.value = true; error.value = ''
   try {
     const initial = !job.value
     const resume = !initial && shouldResumeConversation(
       payload.text, payload.files.length, Boolean(job.value?.requirements.length))
+    if (!initial && !resume && !payload.files.length && job.value?.requirements.length) {
+      const current = job.value
+      const response = await api<{ job: Job; changes: ProposedChange[] }>(`/jobs/${current.id}/conversation`, {
+        method: 'POST', body: JSON.stringify({ revision: current.revision,
+          supplementary_text: payload.text, allow_external_processing: true }),
+      })
+      job.value = response.job
+      chat.value?.clearComposer()
+      discardProposal()
+      if (response.changes.length) {
+        proposal.value = { jobId: current.id, revision: response.job.revision, changes: response.changes }
+        proposalOpen.value = true
+      }
+      await refreshList()
+      return
+    }
     if (initial) {
       const form = new FormData()
       form.append('title', (payload.text || payload.files[0]?.name || '新报价').slice(0, 80))
@@ -118,6 +193,12 @@ async function sendChat(payload: { text: string; files: File[] }) {
       payload.files.forEach(file => form.append('files', file))
       job.value = await api<Job>('/jobs', { method: 'POST', body: form })
     } else if (payload.files.length && job.value) {
+      if (job.value.requirements.length) {
+        try {
+          await ElMessageBox.confirm('新增附件将重新整理整单需求，原有价格关联会被清除，旧报价将失效。是否继续？', '重新识别资料',
+            { confirmButtonText: '确认重新识别', cancelButtonText: '取消', type: 'warning' })
+        } catch { return }
+      }
       const form = new FormData()
       form.append('revision', String(job.value.revision))
       payload.files.forEach(file => form.append('files', file))
@@ -134,11 +215,64 @@ async function sendChat(payload: { text: string; files: File[] }) {
   finally { busy.value = false }
 }
 async function openJob(id: number) {
+  invalidateRequests()
+  discardProposal()
+  const sequence = navigationSequence
   loading.value = true; error.value = ''
   try {
-    job.value = await api<Job>(`/jobs/${id}`); detailTab.value = 'requirements'; selectedQuoteId.value = null
-  } catch (e) { error.value = err(e) }
-  finally { loading.value = false }
+    const current = await api<Job>(`/jobs/${id}`)
+    if (sequence !== navigationSequence || disposed) return
+    job.value = current; detailTab.value = 'requirements'; selectedQuoteId.value = null
+  } catch (e) { if (sequence === navigationSequence) error.value = err(e) }
+  finally { if (sequence === navigationSequence) loading.value = false }
+}
+async function applyProposal() {
+  if (!proposal.value || !job.value || busy.value) return
+  const pending = proposal.value
+  if (pending.jobId !== job.value.id || pending.revision !== job.value.revision) {
+    dialogError.value = '需求版本已变化，请重新提出修改'; return
+  }
+  busy.value = true; dialogError.value = ''
+  let saved = false
+  try {
+    job.value = await api<Job>(`/jobs/${pending.jobId}/changes`, { method: 'POST',
+      body: JSON.stringify({ revision: pending.revision, changes: pending.changes }) })
+    saved = true
+    discardProposal()
+    const quote = await api<Quote>(`/jobs/${pending.jobId}/quotes`, { method: 'POST',
+      body: JSON.stringify({ revision: job.value.revision,
+        terms: job.value.quotes[0]?.terms || '根据用户确认的局部修改重新计价，费用及范围待审核' }) })
+    await openJob(pending.jobId)
+    selectedQuoteId.value = quote.id
+    detailTab.value = 'quotes'; detailsOpen.value = true
+    ElMessage.success(`修改已保存并重新计价，生成 V${quote.version}`)
+  } catch (e) {
+    if (saved) error.value = `修改已保存，重新计价失败：${err(e)}。请在明细中重新计算报价。`
+    else dialogError.value = err(e)
+  } finally { busy.value = false }
+}
+async function deleteConversation(item: Job) {
+  if (busy.value || item.status === 'processing') return
+  try {
+    await ElMessageBox.confirm(`删除“${item.title}”？该会话的消息、附件和报价记录将永久删除，操作审计保留。`, '删除会话', {
+      confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning',
+    })
+  } catch { return }
+  if (busy.value) return
+  busy.value = true
+  try {
+    const current = job.value?.id === item.id ? job.value : item
+    await api(`/jobs/${item.id}`, { method: 'DELETE',
+      body: JSON.stringify({ revision: current.revision, reason: '用户删除报价会话' }) })
+    if (job.value?.id === item.id) {
+      newConversation()
+      chat.value?.clearComposer()
+    }
+    if (jobs.value.length === 1 && page.value > 1) page.value--
+    await refreshList()
+    ElMessage.success('会话已删除')
+  } catch (e) { ElMessage.error(err(e)) }
+  finally { busy.value = false }
 }
 function chooseFiles(event: Event) {
   const input = event.target as HTMLInputElement
@@ -235,16 +369,24 @@ function editReviewLine(id: string, match = false) {
 }
 async function stopAgent() {
   if (!job.value) return
+  invalidateRequests()
+  const id = job.value.id
+  const sequence = navigationSequence
   try {
-    job.value = await api<Job>(`/jobs/${job.value.id}/agent/stop`, { method: 'POST',
+    const current = await api<Job>(`/jobs/${id}/agent/stop`, { method: 'POST',
       body: JSON.stringify({ revision: job.value.revision, reason: '管理员停止 Agent' }) })
+    if (sequence === navigationSequence && job.value?.id === id) job.value = current
   } catch (e) { ElMessage.error(err(e)) }
 }
 async function recover() {
   if (!job.value) return
+  invalidateRequests()
+  const id = job.value.id
+  const sequence = navigationSequence
   try {
-    job.value = await api<Job>(`/jobs/${job.value.id}/recover`, { method: 'POST',
+    const current = await api<Job>(`/jobs/${id}/recover`, { method: 'POST',
       body: JSON.stringify({ revision: job.value.revision, reason: '管理员恢复中断识别' }) })
+    if (sequence === navigationSequence && job.value?.id === id) job.value = current
   } catch (e) { ElMessage.error(err(e)) }
 }
 function editLine(line?: Line) {
@@ -375,10 +517,11 @@ function showEvidence(fileId: number, pageNumber: number) {
 }
 onMounted(() => {
   refresh()
-  pollTimer = setInterval(() => { if (job.value?.status === 'processing') refresh() }, 3000)
+  pollTimer = setInterval(pollProgress, 3000)
 })
 onBeforeUnmount(() => {
   disposed = true
+  invalidateRequests()
   clearInterval(pollTimer)
   if (previewUrl.value) URL.revokeObjectURL(previewUrl.value)
 })
@@ -386,10 +529,19 @@ onBeforeUnmount(() => {
 
 <template>
   <QuoteChat ref="chat" :job="job" :jobs="jobs" :total="total" :page="page" :busy="busy" :loading="loading"
-    :configured="config.configured" :error="error" @send="sendChat" @open="openJob" @fresh="newConversation"
+    :configured="config.configured" :error="error" @send="sendChat" @open="openJob" @fresh="newConversation" @remove="deleteConversation"
     @settings="key = ''; dialogError = ''; keyOpen = true" @refresh="refresh" @stop="stopAgent" @recover="recover"
     @details="openDetails" @preview="preview" @search="query = $event; page = 1; refresh()"
     @page="page = $event; refresh()" @manual="startCreate" @edit-estimate="editReviewLine($event)" />
+  <el-dialog v-model="proposalOpen" title="确认局部需求修改" width="min(720px, 96vw)" :close-on-click-modal="false" :close-on-press-escape="!busy" :show-close="!busy" @open="dialogError = ''" @closed="discardProposal">
+    <div v-for="change in proposal?.changes || []" :key="`${change.line_id}:${change.field}`" class="proposal-change">
+      <strong>{{ job?.requirements.find(line => line.id === change.line_id)?.product }} · {{ fieldLabels[change.field] || change.field }}</strong>
+      <div><span>原始：{{ job?.requirements.find(line => line.id === change.line_id)?.[change.field] ?? '未提供' }}</span><ArrowRight :size="16" /><span>修改为：{{ change.value ?? '未提供' }}</span></div>
+      <p>{{ change.reason }}</p>
+    </div>
+    <div v-if="dialogError" class="form-error">{{ dialogError }}</div>
+    <template #footer><el-button :disabled="busy" @click="discardProposal">取消修改</el-button><el-button type="primary" :loading="busy" @click="applyProposal">确认修改并重新计价</el-button></template>
+  </el-dialog>
   <el-drawer v-model="detailsOpen" title="明细与报价" size="min(1080px, 100vw)">
   <div class="requirements-workspace">
     <div class="page-heading"><div><div class="section-eyebrow">CUSTOMER REQUIREMENTS</div><h2>{{ job ? job.title : '客户需求' }}</h2></div></div>
@@ -410,13 +562,13 @@ onBeforeUnmount(() => {
     <template v-else>
       <div class="job-meta"><button class="source-link" @click="job = null; refresh()"><ArrowLeft :size="14" />全部需求</button><span>{{ job.customer || '未指定客户' }}</span><span>#{{ job.id }} · 需求版本 {{ job.revision }}</span><span :class="['status-badge', job.status === 'ready' ? 'active' : 'draft']">{{ jobLabels[job.status] }}</span></div>
       <section class="customer-files"><div class="section-title"><h2>客户资料</h2><span>{{ job.files.reduce((sum, f) => sum + f.page_count, 0) }} 页</span></div><div class="file-list"><button v-for="file in job.files" :key="file.id" class="customer-file" @click="preview(file)"><component :is="file.media_type === 'application/pdf' ? FileText : FileImage" :size="22" /><div><strong>{{ file.filename }}</strong><small>{{ file.page_count }} 页 · {{ (file.byte_size / 1024).toFixed(0) }} KB</small></div><ChevronRight :size="15" /></button></div><p v-if="job.brief" class="brief-text">{{ job.brief }}</p></section>
-      <div class="job-actions"><span>{{ job.extraction.summary || '需求整理' }}</span><el-button v-if="job.status === 'processing'" @click="recover">恢复中断任务</el-button><el-button v-if="latestAgent?.status === 'processing'" type="danger" plain @click="stopAgent"><X :size="16" />停止</el-button><el-button :disabled="busy || !config.configured || job.status === 'processing'" @click="startExtraction(false)">{{ job.requirements.length ? '手动补充识别' : '仅识别' }}</el-button><el-button type="primary" :disabled="busy || !config.configured || job.status === 'processing'" :loading="job.status === 'processing'" @click="startExtraction(true)"><Sparkles :size="16" />{{ latestAgent ? '继续 Agent 报价' : 'Agent 自动报价' }}</el-button></div>
+      <div class="job-actions"><span>{{ job.extraction.summary || '需求整理' }}</span><el-button v-if="job.status === 'processing' && !latestAgent?.usage.durable" @click="recover">恢复中断任务</el-button><el-button v-if="latestAgent?.status === 'processing'" type="danger" plain @click="stopAgent"><X :size="16" />停止</el-button><el-button :disabled="busy || !config.configured || job.status === 'processing'" @click="startExtraction(false)">{{ job.requirements.length ? '手动补充识别' : '仅识别' }}</el-button><el-button type="primary" :disabled="busy || !config.configured || job.status === 'processing'" :loading="job.status === 'processing'" @click="startExtraction(true)"><Sparkles :size="16" />{{ latestAgent ? '继续 Agent 报价' : 'Agent 自动报价' }}</el-button></div>
       <section v-if="latestAgent" class="agent-progress">
         <div class="section-title"><h2>Agent #{{ latestAgent.id }}</h2><span>{{ agentStatus[latestAgent.status] || latestAgent.status }} · {{ latestAgent.steps.length }} 步 · {{ latestAgent.usage.total_tokens || 0 }} tokens</span></div>
         <p v-if="latestAgent.message" class="brief-text">{{ latestAgent.message }}</p>
         <details v-for="(step, index) in latestAgent.steps" :key="index" class="agent-step">
           <summary>{{ index + 1 }}. {{ toolLabels[step.tool] || step.tool }} <span v-if="step.arguments.query">· {{ step.arguments.query }}</span><span v-if="step.tool === 'search_prices'"> · {{ step.result.total ?? 0 }} 条</span><span v-else-if="step.result.total"> · ¥ {{ step.result.total }}</span><span v-if="step.result.selected"> · 已关联</span><span v-if="step.result.error"> · 参数待修正</span></summary>
-          <pre>{{ JSON.stringify({ input: step.arguments, output: step.result }, null, 2) }}</pre>
+          <AgentStepDetails :key="`${latestAgent.id}:${index}`" :job-id="job.id" :run-id="latestAgent.id" :index="index" />
         </details>
       </section>
       <div v-if="job.runs[0]?.error" class="error-banner">{{ job.runs[0].error }}</div>
@@ -441,6 +593,7 @@ onBeforeUnmount(() => {
           <el-table class="requirements-desktop-table" :data="selectedQuote.payload.lines"><el-table-column prop="product" label="产品" min-width="160" /><el-table-column label="单价 / 估价依据" min-width="310"><template #default="{ row }"><QuotePricingDetails :line="row" /><span v-if="!row.blockers.length" class="formula-text">{{ row.formula }}</span><ul v-else-if="!selectedQuote.payload.confirmation_items" class="blocker-list"><li v-for="b in row.blockers" :key="b">{{ b }}</li></ul></template></el-table-column><el-table-column label="成品金额(CNY)" align="right" width="140"><template #default="{ row }"><strong>{{ money(row.amount) }}</strong></template></el-table-column></el-table>
           <div class="requirements-mobile-list"><article v-for="line in selectedQuote.payload.lines" :key="line.line_id"><div class="mobile-line-heading"><strong>{{ line.product }}</strong><strong class="mobile-amount">{{ line.amount === null ? '金额待补充' : `¥ ${money(line.amount)}` }}</strong></div><QuotePricingDetails :line="line" /><p v-if="!line.blockers.length" class="formula-text">{{ line.formula }}</p><ul v-else-if="!selectedQuote.payload.confirmation_items" class="blocker-list"><li v-for="b in line.blockers" :key="b">{{ b }}</li></ul></article></div>
           <QuoteConfirmations :items="selectedQuote.payload.confirmation_items" />
+          <QuoteVersionDiff :current="selectedQuote" :previous="previousQuote" />
           <EstimateReviewList :lines="selectedQuote.payload.lines" :disabled="busy || selectedQuote.outdated || job.status === 'processing'" @edit="editReviewLine($event)" />
           <div class="quote-total"><span>{{ selectedQuote.payload.complete ? '报价合计' : quoteDisplayTotal(selectedQuote.payload) === null ? '成品总价待补充' : '已计价成品小计（非完整报价）' }}</span><strong>{{ quoteDisplayTotal(selectedQuote.payload) === null ? '待确认' : `¥ ${money(quoteDisplayTotal(selectedQuote.payload))}` }}</strong></div><div class="quote-terms"><h3>报价条款</h3><p>{{ selectedQuote.terms }}</p><p v-if="selectedQuote.approval_note">批准说明：{{ selectedQuote.approval_note }}</p></div></template>
           <el-empty v-else description="暂无报价草稿" />

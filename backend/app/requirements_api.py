@@ -1,16 +1,18 @@
 import csv
 import io
 import uuid
+import time
 from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from . import deepseek
 from .config import settings
+from .conversation import ConfirmChanges
 from .customer_files import FileRejected, cleanup_file, prepare_file, storage_path
 from .database import get_db
 from .models import AgentRun, CustomerFile, ExtractionRun, PriceItem, PricingRule, QuoteDraft, RequirementJob, now
@@ -75,6 +77,62 @@ def view_job(db, job, detail=False):
         for key in ("extraction", "requirements", "messages", "brief"):
             data.pop(key)
     return data
+
+
+@router.get("/jobs/{job_id}/progress")
+def job_progress(job_id: int, db: DB, run_id: int = 0, after: int = Query(default=0, ge=0)):
+    """Polling does not transfer files, quote versions, or historical tool payloads."""
+    from .agent_loop import model_result
+    job = job_for(db, job_id)
+    run = db.scalar(select(AgentRun).where(AgentRun.job_id == job_id).order_by(AgentRun.id.desc()).limit(1))
+    progress = None
+    if settings().agent_background:
+        from .agent_checkpoints import read_checkpoint
+        try:
+            candidate = read_checkpoint(job.id)
+            if candidate and candidate["revision"] == job.revision:
+                progress = candidate
+        except Exception:
+            pass
+    if progress is None:
+        from decimal import Decimal
+        from .quote_engine import calculate_line
+        lines = [calculate_line(db, RequirementLine.model_validate(raw), automatic=True)
+                 for raw in job.requirements]
+        progress = {"line_count": len(lines),
+                    "priced_count": sum(line["amount"] is not None for line in lines),
+                    "known_subtotal": str(sum((Decimal(line["amount"]) for line in lines
+                                              if line["amount"] is not None), Decimal(0))),
+                    "complete": bool(lines) and all(line["amount"] is not None and not line["blockers"] for line in lines),
+                    "saved_at": job.updated_at.timestamp()}
+    result = {"id": job.id, "revision": job.revision, "status": job.status,
+              "pricing_progress": progress, "run": None, "server_time": time.time()}
+    if run:
+        usage = run.usage
+        phase = usage.get("phase", "queued") if run.status == "processing" else run.status
+        offset = min(after, len(run.steps)) if run.id == run_id else 0
+        latest = run.steps[-1] if run.steps else None
+        active_id = latest.get("arguments", {}).get("line_id") if latest else None
+        result["run"] = {
+            "id": run.id, "status": run.status, "message": run.message,
+            "created_at": run.created_at.isoformat() + "Z", "usage": usage,
+            "phase": phase, "step_count": len(run.steps), "offset": offset,
+            "active_product": usage.get("active_product") or next(
+                (line["product"] for line in job.requirements if line["id"] == active_id), ""),
+            "steps": [{**step, "arguments": {k: v for k, v in step["arguments"].items()
+                                           if k in ("line_id", "query", "price_id", "case_id")},
+                       "result": model_result(step["tool"], step["result"])}
+                      for step in run.steps[offset:offset + 50]],
+        }
+    return result
+
+
+@router.get("/jobs/{job_id}/agent-runs/{run_id}/steps/{index}")
+def agent_step(job_id: int, run_id: int, index: int, db: DB):
+    run = db.scalar(select(AgentRun).where(AgentRun.id == run_id, AgentRun.job_id == job_id))
+    if run is None or not 0 <= index < len(run.steps):
+        raise HTTPException(404, "执行记录不存在")
+    return run.steps[index]
 
 
 @router.get("/model-config")
@@ -155,6 +213,33 @@ def create_job(db: DB, title: Annotated[str, Form(max_length=150)],
 @router.get("/jobs/{job_id}")
 def get_job(job_id: int, db: DB):
     return view_job(db, job_for(db, job_id), True)
+
+
+@router.delete("/jobs/{job_id}")
+def delete_job(job_id: int, data: DeleteInput, db: DB):
+    job = job_for(db, job_id, True)
+    check_revision(job, data.revision)
+    for model in (AgentRun, ExtractionRun):
+        if db.scalar(select(model.id).where(model.job_id == job_id, model.status == "processing").limit(1)):
+            raise HTTPException(409, "会话仍有运行中的任务，请停止或恢复任务后再删除")
+    keys = list(db.scalars(select(CustomerFile.storage_key).where(CustomerFile.job_id == job_id)))
+    if settings().agent_background:
+        from .agent_checkpoints import checkpoint_key, redis_client
+        client = redis_client()
+        prefix = checkpoint_key(job_id)
+        try:
+            cached = list(client.scan_iter(match=f"{prefix}:revision:*"))
+            client.delete(prefix, *cached)
+        except Exception as exc:
+            raise HTTPException(503, "暂时无法清理会话缓存，请稍后重试删除") from exc
+    log_change(db, job, "delete", data.reason, snapshot(job))
+    for model in (QuoteDraft, AgentRun, ExtractionRun, CustomerFile):
+        db.execute(delete(model).where(model.job_id == job_id))
+    db.delete(job)
+    db.commit()
+    for key in keys:
+        cleanup_file(key)
+    return {"deleted": job_id}
 
 
 @router.post("/jobs/{job_id}/files")
@@ -283,6 +368,8 @@ def recover_job(job_id: int, data: DeleteInput, db: DB):
         raise HTTPException(409, "任务状态已变化")
     agent = db.scalar(select(AgentRun).where(AgentRun.job_id == job_id, AgentRun.status == "processing"))
     if agent:
+        if agent.usage.get("durable"):
+            raise HTTPException(409, "后台任务会自动恢复；如需中断，请使用停止按钮")
         from .agent_loop import MAX_TOTAL_SECONDS, finish
         if now() - agent.created_at < timedelta(seconds=MAX_TOTAL_SECONDS + settings().deepseek_timeout * 2 + 90):
             raise HTTPException(409, "Agent 仍在允许时间内，可使用停止按钮")
@@ -326,7 +413,7 @@ def agent_job(job_id: int, data: RunInput, db: DB):
         raise HTTPException(409, "补充识别会替换需求，请确认")
     run = AgentRun(job_id=job_id, model=settings().deepseek_model)
     if settings().agent_background:
-        run.usage = {"durable": True, "request": {
+        run.usage = {"durable": True, "phase": "queued", "request": {
             "supplementary": data.supplementary_text,
             "replace": data.replace_existing if intent == "extract" else False,
             "intent": intent}}
@@ -378,6 +465,59 @@ def update_requirements(job_id: int, data: RequirementsUpdate, db: DB):
     job.status = "ready" if data.lines and all(not missing_requirements(line) for line in data.lines) else "needs_review"
     job.revision += 1
     log_change(db, job, "requirements_update", data.reason, before)
+    db.commit()
+    return view_job(db, job, True)
+
+
+@router.post("/jobs/{job_id}/conversation")
+def converse(job_id: int, data: RunInput, db: DB):
+    from .conversation import propose
+    job = job_for(db, job_id)
+    check_revision(job, data.revision)
+    if not data.allow_external_processing:
+        raise HTTPException(422, "需授权将需求与报价发送给模型")
+    if not data.supplementary_text.strip() or not job.requirements:
+        raise HTTPException(422, "请先整理需求并输入问题")
+    quote = db.scalar(select(QuoteDraft).where(QuoteDraft.job_id == job.id).order_by(QuoteDraft.version.desc()).limit(1))
+    requirements, history = job.requirements, job.messages
+    quote_data = view_quote(db, quote, job) if quote else None
+    db.commit()
+    try:
+        answer, usage = propose(requirements, quote_data, history, data.supplementary_text)
+    except (ValueError, deepseek.ModelFailure) as exc:
+        raise HTTPException(422, "回复未通过校验或模型暂不可用，需求未修改，请重试") from exc
+    db.expire_all()
+    job = job_for(db, job_id, True)
+    check_revision(job, data.revision)
+    messages = [*job.messages,
+                {"role": "user", "text": data.supplementary_text, "at": now().isoformat() + "Z"},
+                {"role": "assistant", "text": answer.answer, "at": now().isoformat() + "Z"}][-40:]
+    # Conversation text is not a pricing revision: do not invalidate approved quotes.
+    db.execute(update(RequirementJob).where(RequirementJob.id == job.id).values(messages=messages))
+    log_change(db, job, "conversation", f"只读报价问答，tokens={usage.get('total_tokens', 0)}")
+    db.commit()
+    db.expire_all()
+    return {"job": view_job(db, job_for(db, job_id), True),
+            "changes": [change.model_dump() for change in answer.changes]}
+
+
+@router.post("/jobs/{job_id}/changes")
+def confirm_changes(job_id: int, data: ConfirmChanges, db: DB):
+    from .conversation import changed_requirements
+    job = job_for(db, job_id, True)
+    check_revision(job, data.revision)
+    try:
+        lines = changed_requirements(job.requirements, data.changes)
+    except ValueError as exc:
+        raise HTTPException(422, "修改字段、值或项目编号无效") from exc
+    before = snapshot(job)
+    job.requirements = lines
+    job.status = "needs_review"
+    job.revision += 1
+    job.messages = [*job.messages, {"role": "assistant", "text": "局部需求修改已确认保存，已保留其他项目与费用方案。新报价需要重新审核。",
+                                   "at": now().isoformat() + "Z"}][-40:]
+    log_change(db, job, "requirement_patch", "用户逐项确认局部修改：" + "；".join(
+        f"{change.line_id}.{change.field}={change.value}" for change in data.changes)[:1800], before)
     db.commit()
     return view_job(db, job, True)
 

@@ -168,6 +168,18 @@ def model_result(name, result):
     return result
 
 
+def discovered_prices(run):
+    """Restore only SQL-audited discoveries; pricing still validates current revisions."""
+    discovered = set()
+    for step in run.steps:
+        if step["tool"] == "search_prices":
+            discovered.update((price["id"], price["revision"]) for price in step["result"].get("prices", []))
+        elif step["tool"] == "analyze_components":
+            for component in step["result"].get("components", []):
+                discovered.update((price["id"], price["revision"]) for price in component.get("references", []))
+    return discovered
+
+
 def context_messages(job, run, db=None):
     requirements = []
     for raw in job.requirements:
@@ -262,10 +274,12 @@ def locked(db, job_id, run_id):
 def event(run, tool, arguments, result):
     run.steps = [*run.steps, {"tool": tool, "arguments": arguments, "result": result,
                             "at": now().isoformat() + "Z"}]
+    run.usage = {**run.usage, "last_event_at": time.time()}
 
 
 def finish(db, job, run, status, message):
     run.status, run.message, run.finished_at = status, message, now()
+    run.usage = {**run.usage, "phase": status, "retry_at": 0}
     job.status = "quoted" if status == "succeeded" else "needs_review" if status == "waiting" else "failed"
     job.messages = [*job.messages, {"role": "assistant", "text": message,
                                   "at": now().isoformat() + "Z"}][-40:]
@@ -275,8 +289,14 @@ def finish(db, job, run, status, message):
 def pending_quote(db, job, run, reason, failure_notice=""):
     """Deliver every requirement, without presenting missing prices as zero."""
     if run.usage.get("durable"):
+        retries = run.usage.get("retry_count", 0) + 1
+        if retries >= settings().agent_max_retries:
+            finish(db, job, run, "waiting", f"自动重试已达上限，需要人工介入。{reason} 已保存进度，可继续报价。")
+            return {"paused": True, "reason": reason}
+        delay = min(settings().agent_retry_seconds * 2 ** min(retries - 1, 6), 900)
         run.message = f"报价尚未完成，进度已保留，将自动继续。{reason}"
-        run.usage = {**run.usage, "retry_at": time.time() + settings().agent_retry_seconds}
+        run.usage = {**run.usage, "retry_count": retries, "phase": "retrying",
+                     "retry_at": time.time() + delay}
         log_change(db, job, "agent_checkpoint", run.message)
         return {"deferred": True, "reason": reason}
     payload = build_quote(db, job.requirements, automatic=True)
@@ -483,6 +503,9 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
         files = list(db.scalars(select(CustomerFile).where(CustomerFile.job_id == job_id).order_by(CustomerFile.id)))
         brief = job.brief + "\n" + "\n".join(m["text"] for m in job.messages[-10:] if m.get("role") == "user")
         previous = job.requirements
+        if run.usage.get("durable") and needs_extract:
+            run.usage = {**run.usage, "phase": "extracting", "last_scheduled_at": time.time()}
+            run.message = "正在整理客户资料，尚未进入计价。"
         db.commit()
         if needs_extract:
             phase = "extract"
@@ -508,15 +531,33 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
                      "reused_line_count": len(job.requirements) if not needs_extract else 0}
         if run.usage.get("durable"):
             run.message = "后台正在逐项计费，已完成项保留在Redis；整单完成后提交人工审核。"
+            run.usage = {**run.usage, "phase": "running", "retry_at": 0,
+                         "last_scheduled_at": time.time()}
         db.commit()
-        discovered, tool_count = set(), 0
-        response_failures = total_response_failures = 0
+        discovered, tool_count = discovered_prices(run), 0
+        response_failures = 0
+        total_response_failures = run.usage.get("response_failures", 0)
         segment, segment_rounds, segment_tools, segment_tokens = 1, 0, 0, 0
         segment_started = time.monotonic()
         for round_number in range(MAX_ROUNDS * MAX_SEGMENTS):
             if interrupted and interrupted():
                 raise Stopped()
             job, run = locked(db, job_id, run_id)
+            if run.usage.get("durable"):
+                if (run.usage.get("total_tokens", 0) >= settings().agent_max_total_tokens
+                        or run.usage.get("cycles", 0) > settings().agent_max_cycles
+                        or run.usage.get("no_progress_rounds", 0) >= settings().agent_max_idle_rounds
+                        or total_response_failures >= MAX_TOTAL_RESPONSE_FAILURES):
+                    finish(db, job, run, "waiting", "已达到累计执行预算、无进展轮次或响应异常上限，需要人工介入；已保存进度，可继续报价。")
+                    db.commit()
+                    return
+                # Yield only between complete tool batches, preserving the model protocol.
+                if round_number and (round_number >= settings().agent_slice_rounds
+                                     or time.monotonic() - started >= settings().agent_slice_seconds):
+                    run.usage = {**run.usage, "phase": "queued", "retry_at": 0}
+                    run.message = "本轮进度已保存，排队继续处理剩余项目。"
+                    db.commit()
+                    return
             # Drop duplicated plans before checking the context budget.
             if run.steps and run.steps[-1]["tool"] in ("complete_estimate", "select_price") and (
                     run.steps[-1]["result"].get("saved") or run.steps[-1]["result"].get("selected")):
@@ -553,6 +594,13 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
                              "context_compactions": run.usage.get("context_compactions", 0) + 1}
             db.commit()
             try:
+                if run.usage.get("durable"):
+                    job, run = locked(db, job_id, run_id)
+                    context = json.loads(messages[1]["content"])
+                    active = context.get("active_requirement") or {}
+                    run.usage = {**run.usage, "active_product": active.get("product", ""),
+                                 "active_line_id": active.get("id", "")}
+                    db.commit()
                 tools = [tool for tool in TOOLS if tool["function"]["name"] not in
                          ("ask_user", "finish_pending_quote")] if run.usage.get("durable") else TOOLS
                 message, usage = deepseek.agent_turn(messages, tools)
@@ -574,6 +622,10 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
                     "message": "本轮响应未执行，保留已保存进度，改为逐项调用并自动重试"})
                 if (response_failures >= MAX_RESPONSE_FAILURES
                         or total_response_failures >= MAX_TOTAL_RESPONSE_FAILURES):
+                    if run.usage.get("durable") and total_response_failures >= MAX_TOTAL_RESPONSE_FAILURES:
+                        finish(db, job, run, "waiting", "累计模型响应异常已达上限，需要人工介入；已保存进度，可继续报价。")
+                        db.commit()
+                        return
                     pending_quote(db, job, run,
                                   "模型连续返回不完整或无效工具响应，已达到自动重试上限。"
                                   "本轮异常调用未执行，已保存的需求与补全方案保留，可继续报价，无需重新上传。",
@@ -596,7 +648,8 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
             job, run = locked(db, job_id, run_id)
             run.usage = {**run.usage, **{k: run.usage.get(k, 0) + int(usage.get(k, 0))
                          for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
-                         "agent_tokens": run.usage.get("agent_tokens", 0) + int(usage.get("total_tokens", 0))}
+                         "agent_tokens": run.usage.get("agent_tokens", 0) + int(usage.get("total_tokens", 0)),
+                         "no_progress_rounds": run.usage.get("no_progress_rounds", 0) + 1}
             segment_rounds += 1
             segment_tokens += int(usage.get("total_tokens", 0))
             db.commit()
@@ -617,6 +670,7 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
                     return
                 name, arguments = call["function"]["name"], call["function"]["arguments"]
                 raw = {}
+                before_requirements = job.requirements
                 try:
                     if name not in TOOL_SPECS:
                         raise ValueError("不允许的工具")
@@ -625,9 +679,17 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
                     raw = json.loads(arguments)
                     args = TOOL_SPECS[name][0].model_validate(raw)
                     result = execute_tool(db, job, run, name, args, discovered)
-                except (ValueError, ValidationError) as exc:
+                except ValidationError as exc:
+                    result = {"error": "工具参数校验失败，请修正指定字段", "type": "ValidationError",
+                              "fields": [{"path": ".".join(str(p) for p in e["loc"]),
+                                          "type": e["type"], "message": e["msg"][:250]}
+                                         for e in exc.errors(include_input=False, include_url=False)[:12]]}
+                except ValueError as exc:
                     result = {"error": "工具或参数无效，请按照 schema 重试", "type": type(exc).__name__}
                 event(run, name[:100], raw, result)
+                if (result.get("saved") or result.get("selected")) and job.requirements != before_requirements:
+                    run.usage = {**run.usage, "retry_count": 0, "no_progress_rounds": 0,
+                                 "last_progress_at": time.time()}
                 terminal = run.status != "processing" or result.get("deferred", False)
                 db.commit()
                 if run.usage.get("durable") and (
@@ -658,7 +720,10 @@ def run_agent(db, job_id, run_id, supplementary="", replace=False, intent="auto"
                     "phase": "extract", "preserved_line_count": len(job.requirements),
                     "diagnostics": getattr(exc, "diagnostics", {}),
                     "message": "需求识别未通过，未进入查价；已保存需求未覆盖"})
-            if run.usage.get("durable"):
+            if (run.usage.get("durable") and isinstance(exc, deepseek.ModelFailure)
+                    and exc.diagnostics.get("retryable") is False):
+                finish(db, job, run, "waiting", f"{exc}；需要人工介入，修复后可继续，已保存进度不变。")
+            elif run.usage.get("durable"):
                 pending_quote(db, job, run, "模型或存储暂时不可用，后台将从已提交进度重试。")
             else:
                 finish(db, job, run, "failed", str(exc) if isinstance(exc, deepseek.ModelFailure)
