@@ -16,8 +16,8 @@ from .pricing_cases import search_cases, evaluate_case, case_references
 from .pricing_diagnostics import repair_contract, line_resolution
 from .pricing_scope import rule_scope
 from .quote_engine import (
-    build_quote, calculate_line, price_source, unit_price_usable,
-    confirmation_items
+    build_quote, calculate_line, preload_sources, price_source, unit_price_usable,
+    usable_price_ids, confirmation_items
 )
 from .requirements_schemas import RequirementLine
 from .services import log_change, snapshot
@@ -323,11 +323,12 @@ def execute_tool(db, job, run, name, args, discovered, interrupted=None):
         if args.material:
             stmt = stmt.where(PriceItem.material.contains(args.material, autoescape=True))
         total = db.scalar(select(func.count()).select_from(stmt.subquery()))
-        prices = list(db.scalars(stmt.order_by(PriceItem.id).offset(args.offset).limit(20)))
-        discovered.update((p.id, p.revision) for p in prices)
+        rows = db.execute(stmt.add_columns(Product.name).order_by(PriceItem.id).offset(args.offset).limit(20)).all()
+        preload_sources(db, [p for p, _ in rows])
+        discovered.update((p.id, p.revision) for p, _ in rows)
         return {"total": total, "next_offset": args.offset + 20 if args.offset + 20 < total else None,
-                "prices": [{**snapshot(p), "product": db.get(Product, p.product_id).name,
-                            "source": price_source(db, p)} for p in prices]}
+                "prices": [{**snapshot(p), "product": name,
+                            "source": price_source(db, p)} for p, name in rows]}
 
     if name in ("evaluate_price", "select_price"):
         if (args.price_id, args.revision) not in discovered:
@@ -351,16 +352,7 @@ def execute_tool(db, job, run, name, args, discovered, interrupted=None):
             result["price"] = {**snapshot(price), "product": db.get(Product, price.product_id).name,
                                "source": price_source(db, price)}
         # Check the entire product, not merely the model's current search page.
-        alternatives = []
-        for other in db.scalars(select(PriceItem).where(
-                PriceItem.product_id == price.product_id, PriceItem.status == "active")):
-            candidate = line.model_copy(update={"selected_price_id": other.id,
-                                                "selected_price_revision": other.revision})
-            if unit_price_usable(calculate_line(db, candidate, automatic=True)):
-                alternatives.append(other.id)
-                if len(alternatives) >= 2:
-                    break
-        if len(alternatives) > 1:
+        if len(usable_price_ids(db, line, price.product_id)) > 1:
             result["blockers"].append("存在多个适用价格，需要确认价格策略，不能自行择价")
             result["amount"] = None
             result["unit_price"] = None
@@ -394,14 +386,7 @@ def execute_tool(db, job, run, name, args, discovered, interrupted=None):
                 continue
             line = RequirementLine.model_validate(raw)
             price = db.get(PriceItem, line.selected_price_id)
-            eligible = 0
-            for other in db.scalars(select(PriceItem).where(
-                    PriceItem.product_id == price.product_id, PriceItem.status == "active")):
-                candidate = line.model_copy(update={"selected_price_id": other.id,
-                                                    "selected_price_revision": other.revision})
-                if unit_price_usable(calculate_line(db, candidate, automatic=True)):
-                    eligible += 1
-            if eligible > 1:
+            if len(usable_price_ids(db, line, price.product_id)) > 1:
                 result["blockers"].append("存在多个适用价格，需要人工确认")
                 result["amount"] = None
                 result["unit_price"] = None

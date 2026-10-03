@@ -14,13 +14,14 @@ def candidate_prices(db, line, query=""):
     term = (query or line.pricing_category or line.product).strip()
     if not term:
         return []
-    stmt = select(PriceItem).join(Product).where(
+    stmt = select(PriceItem, Product.name).join(Product).where(
         PriceItem.status != "inactive",
         or_(Product.name.contains(term, autoescape=True), PriceItem.material.contains(term, autoescape=True)),
     ).order_by(PriceItem.id).limit(200)
+    rows = db.execute(stmt).all()
+    preload_sources(db, [price for price, _ in rows])
     candidates = []
-    for price in db.scalars(stmt):
-        product = db.get(Product, price.product_id)
+    for price, product_name in rows:
         mismatches = []
         if line.material and price.material and line.material != price.material:
             mismatches.append("材质不同")
@@ -29,10 +30,18 @@ def candidate_prices(db, line, query=""):
         if line.language != "unknown" and price.language not in ("all", line.language):
             mismatches.append("文字类型不同")
         value = snapshot(price)
-        value.update(product=product.name, mismatches=mismatches, source=price_source(db, price))
+        value.update(product=product_name, mismatches=mismatches, source=price_source(db, price))
         candidates.append(value)
     candidates.sort(key=lambda x: (len(x["mismatches"]), x["status"] != "active", x["id"]))
     return candidates[:40]
+
+
+def preload_sources(db, prices):
+    # Load source records and documents in one query so price_source hits the identity map.
+    ids = {price.source_record_id for price in prices if price.source_record_id}
+    if ids:
+        db.execute(select(SourceRecord, SourceDocument).join(
+            SourceDocument, SourceRecord.document_id == SourceDocument.id).where(SourceRecord.id.in_(ids))).all()
 
 
 def price_source(db, price):
@@ -74,15 +83,20 @@ def automatic_blockers(db, line, price):
     return blockers
 
 
-def pricing_warnings(db, line, price=None):
+def scoped_rules(db, price):
+    return list(db.scalars(select(PricingRule).where(rule_scope(db, price)).order_by(PricingRule.id)))
+
+
+def pricing_warnings(db, line, price=None, rules=None):
     warnings = list(line.uncertainties)
     if price:
         if price.spec or price.quality or price.notes or price.review_reason == "待确认":
             warnings.append("按候选价格先估价，规格/品质/备注条件待复核：" +
                             "；".join(v for v in (price.spec, price.quality, price.notes) if v)[:1000])
-        rules = list(db.scalars(select(PricingRule).where(rule_scope(db, price)).order_by(PricingRule.id).limit(6)))
+        if rules is None:
+            rules = scoped_rules(db, price)
         if rules:
-            warnings.append("相关规则尚未计入本次估价，待人工补充：" + "；".join(r.name for r in rules))
+            warnings.append("相关规则尚未计入本次估价，待人工补充：" + "；".join(r.name for r in rules[:6]))
     return list(dict.fromkeys(warnings))
 
 
@@ -91,7 +105,26 @@ def unit_price_usable(result):
         blocker != "单件数量" for blocker in result["blockers"])
 
 
-def calculate_line(db, line: RequirementLine, automatic=False):
+def usable_price_ids(db, line, product_id, limit=2):
+    """Active prices of a product that would price this line automatically, up to limit."""
+    # The identity map holds weak references; keep the product alive so db.get() inside
+    # calculate_line is served from the session instead of re-querying per alternative.
+    product = db.get(Product, product_id)  # noqa: F841
+    usable = []
+    for other in db.scalars(select(PriceItem).where(
+            PriceItem.product_id == product_id, PriceItem.status == "active").order_by(PriceItem.id)):
+        candidate = line.model_copy(update={"selected_price_id": other.id,
+                                            "selected_price_revision": other.revision})
+        if unit_price_usable(calculate_line(db, candidate, automatic=True, details=False)):
+            usable.append(other.id)
+            if len(usable) >= limit:
+                break
+    return usable
+
+
+def calculate_line(db, line: RequirementLine, automatic=False, details=True):
+    # details=False skips rule and source lookups that only feed warnings and snapshots;
+    # blockers and amounts are identical, so unit_price_usable gives the same answer.
     try:
         business_rules.validate_fees(line)
         if line.estimate is None:
@@ -109,8 +142,9 @@ def calculate_line(db, line: RequirementLine, automatic=False):
     if automatic and "需求人工确认" in blockers:
         blockers.remove("需求人工确认")
     price = db.get(PriceItem, line.selected_price_id) if line.selected_price_id else None
+    rules = (scoped_rules(db, price) if details else []) if price else None
     result = {"line_id": line.id, "product": line.product, "requirement": line.model_dump(mode="json"),
-              "blockers": blockers, "warnings": [*pricing_warnings(db, line, price), *business_rules.warnings(line)],
+              "blockers": blockers, "warnings": [*pricing_warnings(db, line, price, rules), *business_rules.warnings(line)],
               "amount": None, "unit_price": None, "unit_formula": "",
               "fixed_charges": str(sum((c.amount for c in line.extras if c.basis == "total"), Decimal(0))),
               "price": None, "formula": ""}
@@ -145,10 +179,10 @@ def calculate_line(db, line: RequirementLine, automatic=False):
         return result
     if automatic:
         blockers.extend(automatic_blockers(db, line, price))
-    result["price"] = {**snapshot(price), "product": db.get(Product, price.product_id).name,
-                       "source": price_source(db, price)}
-    result["rule_revisions"] = [[r.id, r.revision] for r in db.scalars(
-        select(PricingRule).where(rule_scope(db, price)).order_by(PricingRule.id))]
+    if details:
+        result["price"] = {**snapshot(price), "product": db.get(Product, price.product_id).name,
+                           "source": price_source(db, price)}
+        result["rule_revisions"] = [[r.id, r.revision] for r in rules]
     if price.status != "active":
         blockers.append("所选价格尚未启用")
     if "待确认" in db.get(Product, price.product_id).name:
@@ -228,16 +262,9 @@ def build_quote(db, requirements, automatic=False, rounding="none"):
         if automatic and unit_price_usable(line) and not line.get("manual_price") and not line.get("estimated"):
             requirement = RequirementLine.model_validate(line["requirement"])
             price = db.get(PriceItem, requirement.selected_price_id)
-            eligible = 0
-            for other in db.scalars(select(PriceItem).where(
-                    PriceItem.product_id == price.product_id, PriceItem.status == "active")):
-                candidate = requirement.model_copy(update={
-                    "selected_price_id": other.id, "selected_price_revision": other.revision})
-                eligible += unit_price_usable(calculate_line(db, candidate, automatic=True))
-                if eligible > 1:
-                    line["blockers"].append("存在多个适用价格，需要人工确认")
-                    line["amount"] = line["unit_price"] = None
-                    break
+            if len(usable_price_ids(db, requirement, price.product_id)) > 1:
+                line["blockers"].append("存在多个适用价格，需要人工确认")
+                line["amount"] = line["unit_price"] = None
         line["component_analysis"] = analyze_components(db, RequirementLine.model_validate(line["requirement"]))
         line["estimate_conditions"] = list(line["warnings"])
         if line.get("estimated"):
@@ -329,17 +356,9 @@ def quote_stale(db, quote, job):
                 requirement = RequirementLine.model_validate(line["requirement"])
                 if automatic_blockers(db, requirement, price):
                     return True
-                current_rules = [[r.id, r.revision] for r in db.scalars(
-                    select(PricingRule).where(rule_scope(db, price)).order_by(PricingRule.id))]
+                current_rules = [[r.id, r.revision] for r in scoped_rules(db, price)]
                 if current_rules != line.get("rule_revisions", []):
                     return True
-                count = 0
-                for other in db.scalars(select(PriceItem).where(
-                        PriceItem.product_id == price.product_id, PriceItem.status == "active")):
-                    candidate = requirement.model_copy(update={
-                        "selected_price_id": other.id, "selected_price_revision": other.revision})
-                    if unit_price_usable(calculate_line(db, candidate, automatic=True)):
-                        count += 1
-                if count != 1:
+                if len(usable_price_ids(db, requirement, price.product_id)) != 1:
                     return True
     return False

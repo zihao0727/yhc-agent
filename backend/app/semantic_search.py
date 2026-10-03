@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from .config import settings
 from .models import PriceItem, Product
-from .quote_engine import price_source
+from .quote_engine import preload_sources, price_source
 from .services import snapshot
 
 logger = logging.getLogger(__name__)
@@ -209,9 +209,11 @@ def search_prices(db, query, material="", status="active", offset=0, check=lambd
             if pair is None or document(*pair) != documents[index]:
                 continue
             candidates.append((pair, float(similarities[index])))
+        page = candidates[offset:offset + 20]
+        preload_sources(db, [price for (price, _), _ in page])
         prices = [{**snapshot(price), "product": name, "source": price_source(db, price),
                    "similarity": round(score, 6)}
-                  for (price, name), score in candidates[offset:offset + 20]]
+                  for (price, name), score in page]
         return {"prices": prices, "total": len(candidates),
                 "next_offset": offset + 20 if offset + 20 < len(candidates) else None,
                 "model": provider.model, "candidate_only": True, "notice": NOTICE,
