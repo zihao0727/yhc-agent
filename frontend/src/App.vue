@@ -2,9 +2,10 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequirementsWorkspace from './RequirementsWorkspace.vue'
+import { costKinds } from './requirements-types'
 import {
-  ArrowLeft, ArrowRight, BookOpen, Check, ChevronRight, CircleHelp, Database, FileSpreadsheet,
-  History, Lightbulb, ListFilter, LockKeyhole, LogOut, Menu, Pencil, Plus, RefreshCw, Search, ShieldCheck,
+  ArrowRight, BookOpen, Check, ChevronRight, CircleHelp, FileSpreadsheet,
+  History, Lightbulb, ListFilter, LockKeyhole, LogOut, Menu, Moon, Pencil, Plus, RefreshCw, Search, ShieldCheck, Sun,
   SlidersHorizontal, TableProperties, Trash2, X,
 } from 'lucide-vue-next'
 import {
@@ -13,6 +14,16 @@ import {
 } from './api'
 
 type View = 'jobs' | 'prices' | 'rules' | 'documents' | 'audit'
+const theme = ref<'light' | 'dark'>(localStorage.getItem('firefly-theme') === 'dark' ? 'dark' : 'light')
+function applyTheme() {
+  document.documentElement.classList.toggle('dark', theme.value === 'dark')
+  localStorage.setItem('firefly-theme', theme.value)
+}
+function toggleTheme() {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark'
+  applyTheme()
+}
+applyTheme()
 const nav = [
   { id: 'jobs' as View, label: '客户需求', icon: BookOpen },
   { id: 'prices' as View, label: '价格明细', icon: TableProperties },
@@ -66,6 +77,7 @@ const defaults = () => ({
   category: '发光字与金属字', product: '', material: '', thickness_mm: '' as string | null, spec: '',
   language: 'all', process: '', quality: '', unit: 'cm', amount: '' as string | null,
   price_kind: 'standard', status: 'active', notes: '', review_reason: '', revision: undefined as number | undefined,
+  included_cost_kinds: [] as string[],
 })
 const form = reactive(defaults())
 const ruleForm = reactive({
@@ -152,6 +164,7 @@ function editPrice(item?: Price) {
       if (key in item) (form as Record<string, unknown>)[key] = item[key as keyof Price]
     }
     form.review_reason = ''
+    form.included_cost_kinds = [...(item.included_cost_kinds || [])]
   }
   formError.value = ''; priceDialog.value = true
 }
@@ -234,7 +247,7 @@ onUnmounted(() => {
 
 <template>
   <div v-if="!loggedIn" class="login-page">
-    <div class="login-brand"><span class="brand-symbol"><Lightbulb :size="24" /></span><strong>萤火虫</strong><span>报价管理</span></div>
+    <div class="login-brand"><span class="brand-symbol"><Lightbulb :size="24" /></span><strong>萤火虫</strong><span>报价管理</span><el-tooltip :content="theme === 'dark' ? '切换日间模式' : '切换夜间模式'"><button class="icon-button bordered theme-toggle" :aria-label="theme === 'dark' ? '切换日间模式' : '切换夜间模式'" @click="toggleTheme"><Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" /></button></el-tooltip></div>
     <form class="login-form" @submit.prevent="login">
       <span class="section-eyebrow">WORKSPACE ACCESS</span>
       <h1>登录报价工作区</h1>
@@ -264,7 +277,7 @@ onUnmounted(() => {
       <header class="topbar">
         <button class="icon-button mobile-menu" aria-label="打开导航" @click="mobileNav = true"><Menu :size="20" /></button>
         <div class="breadcrumb">报价资料库<ChevronRight :size="14" /><strong>{{ title }}</strong></div>
-        <div class="topbar-right"><span class="local-label"><span></span>本地工作区</span><span class="avatar small">管</span></div>
+        <div class="topbar-right"><span class="local-label"><span></span>本地工作区</span><el-tooltip :content="theme === 'dark' ? '切换日间模式' : '切换夜间模式'"><button class="icon-button bordered theme-toggle" :aria-label="theme === 'dark' ? '切换日间模式' : '切换夜间模式'" @click="toggleTheme"><Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" /></button></el-tooltip><span class="avatar small">管</span></div>
       </header>
       <main>
         <RequirementsWorkspace v-if="view === 'jobs'" />
@@ -368,6 +381,7 @@ onUnmounted(() => {
         <el-form-item label="单价 (CNY)"><el-input v-model="form.amount" inputmode="decimal" placeholder="待确认" /></el-form-item>
         <el-form-item label="计价单位"><el-select v-model="form.unit"><el-option v-for="(label, key) in unitLabels" :key="key" :label="label" :value="key" /></el-select></el-form-item>
         <el-form-item label="价格性质"><el-select v-model="form.price_kind"><el-option v-for="(label, key) in kindLabels" :key="key" :label="label" :value="key" /></el-select></el-form-item>
+        <el-form-item label="单价已含费用"><el-select v-model="form.included_cost_kinds" multiple aria-label="单价已含费用"><el-option v-for="kind in ['material', 'process', 'power', 'bracket', 'outsourcing']" :key="kind" :value="kind" :label="costKinds[kind]" /></el-select></el-form-item>
         <el-form-item label="状态"><el-select v-model="form.status"><el-option v-for="(label, key) in statusLabels" :key="key" :label="label" :value="key" /></el-select></el-form-item>
       </div>
       <el-form-item label="备注"><el-input v-model="form.notes" type="textarea" :rows="3" maxlength="10000" /></el-form-item>

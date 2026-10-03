@@ -6,6 +6,7 @@ export type Price = {
   process: string; quality: string; unit: string; amount: string | null; price_kind: string
   status: Status; notes: string; review_reason: string; revision: number; source: Source | null
   attributes?: Record<string, unknown>; updated_at: string
+  included_cost_kinds?: string[] | null
 }
 export type Rule = {
   id: number; product_id: number | null; product: string; name: string; content: string
@@ -25,7 +26,7 @@ export type Options = {
 }
 export type Stats = { prices: number; draft: number; active: number; inactive: number; products: number; rules: number; documents: number }
 export const statusLabels: Record<string, string> = { draft: '待确认', active: '已启用', inactive: '已停用' }
-export const unitLabels: Record<string, string> = { cm: '元 / cm', m: '元 / m', m2: '元 / ㎡', piece: '元 / 件', set: '元 / 套', unknown: '单位待确认' }
+export const unitLabels: Record<string, string> = { cm: '元 / cm', m: '元 / m', m2: '元 / ㎡', piece: '元 / 件', set: '元 / 套', fixed: '元 / 整项', hour: '元 / 小时', unknown: '单位待确认' }
 export const kindLabels: Record<string, string> = { standard: '标准价', suggested: '建议价', starting: '起价', reference: '参考价' }
 export const languageLabels: Record<string, string> = { zh: '中文', en: '英文 / 数字', all: '通用', unknown: '待确认' }
 export const ruleLabels: Record<string, string> = { reference: '参考说明', surcharge: '附加费用', constraint: '适用限制', formula: '计价公式', case: '项目案例' }

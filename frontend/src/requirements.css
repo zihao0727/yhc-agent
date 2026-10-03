@@ -35,11 +35,13 @@
 .upload-row { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #e5ebe7; color: #728b7a; font-size: 12px; }
 .upload-row > span { flex: 1; overflow-wrap: anywhere; min-width: 0; }
 .upload-row > small { white-space: nowrap; }
-.model-info { display: flex; justify-content: space-between; margin-bottom: 23px; font-size: 14px; }
+.model-info { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 23px; font-size: 14px; }
+.model-info strong { min-width: 0; overflow-wrap: anywhere; }
+.model-info .status-badge { flex-shrink: 0; align-self: flex-start; }
 .consent-fields { display: flex; flex-direction: column; gap: 12px; margin: 20px 0; }
 .el-checkbox { height: auto; min-height: 28px; }
 .el-checkbox__label { white-space: normal; line-height: 1.7; font-size: 12px; }
-.extra-row { display: grid; grid-template-columns: 1fr 100px 110px 1.4fr 30px; gap: 8px; margin: 10px 0 17px; align-items: center; }
+.extra-row { display: grid; grid-template-columns: minmax(90px, 1fr) 90px 100px 120px minmax(100px, 1.4fr) 30px; gap: 8px; margin: 10px 0 17px; align-items: center; }
 .evidence-link { display: block; margin-bottom: 5px; }
 .rule-reference { padding: 18px 0; border-bottom: 1px solid #e3eae5; }
 .rule-reference h3 { font-size: 12px; font-weight: 600; line-height: 1.7; }
@@ -47,6 +49,17 @@
 .preview-toolbar { display: flex; gap: 20px; align-items: center; justify-content: center; padding: 0 0 16px; color: #85978a; font-size: 12px; }
 .customer-preview { min-height: 200px; max-height: 72vh; overflow: auto; background: #edf1ee; text-align: center; }
 .customer-preview img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.zoom-preview { text-align: left; max-height: 55vh; }
+.zoom-preview img { margin: 0; }
+.excel-source { border-top: 1px solid #dfe6e1; margin-top: 16px; padding-top: 14px; font-size: 12px; overflow-wrap: anywhere; }
+.excel-source h3 { font-size: 14px; margin-bottom: 12px; }
+.excel-source p { margin: 10px 0; color: #7b8b81; }
+.excel-source summary { cursor: pointer; margin-top: 12px; }
+.source-image-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.source-image-actions .el-button { margin-left: 0; }
+.excel-source-row { display: flex; flex-wrap: wrap; gap: 10px; border-bottom: 1px solid #e7ece9; padding: 10px 0; }
+.excel-source-row > span { min-width: 0; white-space: pre-wrap; }
+.excel-source-row small { display: block; color: #7b8b81; }
 .el-dialog__title { overflow-wrap: anywhere; padding-right: 15px; display: inline-block; }
 .requirements-mobile-list { display: none; }
 @media (max-width: 800px) {
@@ -67,6 +80,7 @@
   .requirements-workspace h1 { overflow-wrap: anywhere; }
   .jobs-toolbar .search-box { min-width: 150px; }
   .notice-strip { flex-wrap: wrap; }
+  .preview-toolbar { gap: 10px; flex-wrap: wrap; }
   .message-row > span { float: none; display: block; margin-top: 8px; }
 }
 .agent-progress { padding: 16px 0; border-bottom: 1px solid #dce3df; }
@@ -100,6 +114,7 @@ main:has(.quote-chat-layout) { padding: 0; max-width: none; }
 .chat-progress-strip > div { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .chat-progress-strip progress { display: block; width: 100%; height: 6px; margin: 10px 0; accent-color: #27755c; }
 .chat-progress-strip small { color: #697680; font-size: 11px; font-weight: normal; }
+.chat-progress-strip > small { display: block; margin-top: 3px; }
 .chat-review-summary { font-size: 13px; color: #885c20; }
 .proposal-change { padding: 14px 0; border-bottom: 1px solid #e1e6eb; overflow-wrap: anywhere; }
 .proposal-change > div { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
@@ -163,6 +178,8 @@ main:has(.quote-chat-layout) { padding: 0; max-width: none; }
 .chat-continue { display: flex; gap: 6px; align-items: center; padding: 6px; border: 0; background: transparent; color: #617c6b; font-size: 11px; }
 .chat-continue:disabled { color: #adb5b0; }
 .chat-pricing-details > summary { cursor: pointer; color: #718078; font-size: 12px; }
+.chat-confirmation-details > summary { cursor: pointer; color: #52655a; font-size: 13px; font-weight: 600; padding: 4px 0; }
+.chat-confirmation-details > summary > .confirmation-count { font-size: 11px; font-weight: 400; color: #87938c; margin-left: 10px; }
 .composer-files { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .composer-files > div { display: flex; align-items: center; gap: 6px; max-width: 100%; background: #f3f5f6; padding: 4px 7px; border-radius: 4px; color: #74827a; font-size: 11px; }
 .composer-files span { overflow-wrap: anywhere; min-width: 0; }
@@ -193,3 +210,193 @@ main:has(.quote-chat-layout) { padding: 0; max-width: none; }
   .chat-empty h2 { font-size: 21px; }
   .chat-message { font-size: 13px; }
 }
+.chat-pending-issues { border-bottom: 1px solid #dce4df; padding: 12px 0; overflow-wrap: anywhere; }
+.chat-pending-issues h3 { font-size: 14px; margin: 0 0 8px; }
+.chat-pending-issues > div { padding: 8px 0; }
+.chat-pending-issues strong { font-size: 13px; }
+.chat-pending-issues small { display: block; color: #9d493c; margin-top: 4px; }
+.chat-pending-issues p { font-size: 12px; line-height: 1.6; margin: 4px 0; white-space: pre-wrap; }
+.chat-quote-total.outdated-total strong, .quote-total.outdated-total strong { color: #647168; }
+.chat-resolution-counts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 10px 0; font-size: 12px; color: #67746d; }
+.login-brand .theme-toggle { margin-left: auto; }
+
+html.dark {
+  color-scheme: dark;
+  --el-color-primary: #55a98b;
+  --el-color-primary-light-3: #387e67;
+  --el-color-primary-light-5: #2d6956;
+  --el-color-primary-light-7: #244e42;
+  --el-color-primary-light-8: #203f36;
+  --el-color-primary-light-9: #1d342e;
+  --el-color-primary-dark-2: #83c5aa;
+  --el-text-color-primary: #e1e9e4;
+  --el-text-color-regular: #c0ccc4;
+  --el-text-color-secondary: #96a69b;
+  --el-text-color-placeholder: #718278;
+  --el-border-color: #34463d;
+  --el-border-color-light: #2b3b33;
+  --el-border-color-lighter: #26362f;
+  --el-fill-color: #25352e;
+  --el-fill-color-light: #202e28;
+  --el-fill-color-lighter: #1e2a25;
+  --el-fill-color-blank: #19231f;
+  --el-bg-color: #19231f;
+  --el-bg-color-page: #121a17;
+  --el-bg-color-overlay: #202c26;
+  --el-mask-color: rgb(0 0 0 / 62%);
+  --el-table-header-bg-color: #202d27;
+  --el-table-header-text-color: #9eafa4;
+  --el-table-border-color: #2b3a33;
+  --el-table-row-hover-bg-color: #24342c;
+  --el-table-text-color: #c0ccc4;
+}
+html.dark body { color: #d6e0d9; background: #121a17; }
+html.dark .login-page,
+html.dark .sidebar,
+html.dark .topbar,
+html.dark .table-region,
+html.dark .document-item,
+html.dark .search-box,
+html.dark .customer-file,
+html.dark .chat-composer,
+html.dark .chat-files button,
+html.dark .chat-search { background-color: #19231f; }
+html.dark .sidebar { border-color: #2b3a33; }
+html.dark .topbar,
+html.dark .workspace,
+html.dark .account,
+html.dark .stats-band,
+html.dark .table-region,
+html.dark .page-footer,
+html.dark .document-item,
+html.dark .search-box,
+html.dark .chat-history,
+html.dark .chat-heading,
+html.dark .chat-manual,
+html.dark .chat-progress-strip,
+html.dark .chat-quote,
+html.dark .chat-composer,
+html.dark .customer-file { border-color: #2b3a33; }
+html.dark .workspace-initial,
+html.dark .avatar { color: #b1c3b8; background: #28372f; border-color: #3a4c42; }
+html.dark .brand small,
+html.dark .workspace small,
+html.dark .db-indicator,
+html.dark .db-indicator small,
+html.dark .account small,
+html.dark .breadcrumb,
+html.dark .local-label,
+html.dark .section-eyebrow,
+html.dark .stats-band span,
+html.dark .stats-band small,
+html.dark .table-caption,
+html.dark .pagination-bar,
+html.dark .page-footer,
+html.dark .cell-secondary,
+html.dark .rule-excerpt,
+html.dark .file-hash,
+html.dark .document-metrics span,
+html.dark .detail-list dt,
+html.dark .detail-top span,
+html.dark .revision-item > div span,
+html.dark .detail-source p,
+html.dark .login-brand > span:last-child,
+html.dark .login-form label,
+html.dark .login-meta,
+html.dark .login-page > footer { color: #91a398; }
+html.dark .breadcrumb strong,
+html.dark .account,
+html.dark .table-caption strong,
+html.dark .product-link,
+html.dark .price-value,
+html.dark .detail-list dd,
+html.dark .el-drawer__header,
+html.dark .section-title h2,
+html.dark .section-title h3,
+html.dark .chat-history-heading,
+html.dark .chat-history-item strong,
+html.dark .chat-message > p,
+html.dark .chat-empty h2,
+html.dark .chat-confirmation-details > summary,
+html.dark .quote-confirmations,
+html.dark .confirmation-question { color: #d6e0d9; }
+html.dark .nav-item { color: #a0afa5; }
+html.dark .nav-item.active,
+html.dark .chat-history-row.selected { color: #83c5aa; background: #20382e; }
+html.dark .nav-item:hover,
+html.dark .icon-button:hover { color: #83c5aa; background: #26372f; }
+html.dark .icon-button.bordered { color: #a5b4aa; background: #202c26; border-color: #3a4a41; }
+html.dark .stats-band,
+html.dark .stats-band > div,
+html.dark .detail-source,
+html.dark .revision-item,
+html.dark .document-metrics,
+html.dark .file-hash,
+html.dark .estimate-editor,
+html.dark .business-fields,
+html.dark .cost-editor,
+html.dark .dimension-evidence,
+html.dark .estimate-review,
+html.dark .review-item,
+html.dark .estimate-cost,
+html.dark .rule-reference,
+html.dark .message-row,
+html.dark .customer-files,
+html.dark .job-meta,
+html.dark .upload-row,
+html.dark .excel-source,
+html.dark .excel-source-row,
+html.dark .agent-progress,
+html.dark .agent-step,
+html.dark .quote-version-diff,
+html.dark .version-change,
+html.dark .chat-pending-issues,
+html.dark .chat-quote-line,
+html.dark .confirmation-table td { border-color: #2b3a33; }
+html.dark .nav-count,
+html.dark .product-link:hover,
+html.dark .source-link:hover,
+html.dark .finished-unit,
+html.dark .case-references summary,
+html.dark .component-references summary,
+html.dark .pricing-details summary,
+html.dark .version-change summary { color: #83c5aa; }
+html.dark .search-box input,
+html.dark .chat-search input,
+html.dark .chat-composer textarea { color: #d6e0d9; }
+html.dark .search-box input::placeholder,
+html.dark .chat-composer textarea::placeholder { color: #74857a; }
+html.dark .status-badge.active { color: #83c5aa; background: #20382e; }
+html.dark .status-badge.draft { color: #d6b46d; background: #3a3020; }
+html.dark .status-badge.inactive { color: #9ba69f; background: #29332e; }
+html.dark .sheet-list span,
+html.dark .attributes pre,
+html.dark .agent-step pre,
+html.dark .chat-tool-step pre,
+html.dark .composer-files > div { color: #a9b8ae; background: #202c26; }
+html.dark .chat-history { background: #161f1b; }
+html.dark .chat-history-item:hover,
+html.dark .chat-history-row.selected,
+html.dark .user-message { background: #25332c; }
+html.dark .chat-progress-strip { color: #cad6ce; background: #1b2721; }
+html.dark .chat-progress-strip small,
+html.dark .proposal-change p,
+html.dark .chat-resolution-counts,
+html.dark .review-filters > span,
+html.dark .muted,
+html.dark .source-measurement span,
+html.dark .quote-review-list article { color: #a5b4aa; }
+html.dark .chat-avatar { color: #83c5aa; background: #202d26; border-color: #35473d; }
+html.dark .chat-run { border-color: #3b5145; }
+html.dark .chat-composer:focus-within { border-color: #55a98b; box-shadow: 0 0 0 2px #20382e; }
+html.dark .chat-send:disabled { color: #89978e; background: #2b3931; }
+html.dark .customer-preview { background: #202c26; }
+html.dark .notice-strip,
+html.dark .questions-band { color: #d6bd82; background: #302b20; border-color: #50442b; }
+html.dark .notice-strip,
+html.dark .questions-band { border-top-color: #50442b; border-bottom-color: #50442b; }
+html.dark .questions-band h3,
+html.dark .questions-band ul,
+html.dark .chat-review-summary { color: #d6bd82; }
+html.dark .error-banner,
+html.dark .form-error { color: #edaaaa; background: #382323; border-color: #684040; }
