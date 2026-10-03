@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from app import agent_loop
+from app import agent_execution, agent_loop
 from test_agent_loop import call, prepared, provider, seed, start
 from test_estimate_pricing import plan
 from test_requirements import save_lines
@@ -59,14 +59,14 @@ def test_large_order_completes_all_lines_with_review_list(client, monkeypatch):
     assert "estimate" not in checkpoint[0]["arguments"]
 
 
-def test_model_contract_has_no_business_defaults_or_pause_classification():
+def test_model_contract_has_no_business_defaults_and_supports_three_routes():
     assert set(agent_loop.AskInput.model_fields) == {"question"}
     assert set(agent_loop.PendingInput.model_fields) == {"reason"}
     assert "0.25" not in agent_loop.SYSTEM and "0.13" not in agent_loop.SYSTEM
     assert "暂按1件" not in agent_loop.SYSTEM
     tools = {tool["function"]["name"] for tool in agent_loop.TOOLS}
     assert "complete_estimate" in tools and "read_requirement" in tools
-    assert "select_price" not in tools
+    assert "select_price" in tools and "defer_requirement" in tools
 
 
 def test_model_can_read_full_saved_plan_after_compaction(client, monkeypatch):
@@ -118,7 +118,7 @@ def test_model_chooses_candidate_and_quantity_without_match_policy(
 def test_component_reference_can_be_used_without_redundant_search(client, price_input, monkeypatch):
     price = seed(client, price_input, amount="300")
     job = prepared(client)
-    monkeypatch.setattr(agent_loop, "analyze_components", lambda *args: {
+    monkeypatch.setattr(agent_execution, "analyze_components", lambda *args: {
         "components": [{"references": [{"id": price["id"], "revision": price["revision"]}]}]})
     estimate = plan()
     estimate["costs"][0].update(source="catalog", reference_id=price["id"],

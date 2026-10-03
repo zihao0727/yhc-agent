@@ -93,8 +93,12 @@ def test_worker_yields_and_schedules_another_job(client, monkeypatch, redis_work
     assert len(seen) == 3
 
 
-def test_no_progress_guard_survives_yield(client, monkeypatch, redis_worker):
-    seen = provider(monkeypatch, [call("read_requirement", line_id="line0") for _ in range(2)])
+def test_no_progress_notice_survives_yield_without_pausing(client, monkeypatch, redis_worker):
+    seen = provider(monkeypatch, [
+        *[call("read_requirement", line_id="line0") for _ in range(2)],
+        call("complete_estimate", line_id="line0", estimate=plan()),
+        call("finish_quote"),
+    ])
     monkeypatch.setattr(settings(), "agent_max_idle_rounds", 2)
     monkeypatch.setattr(settings(), "agent_slice_rounds", 1)
     job = enqueue(client, monkeypatch, 1)
@@ -102,9 +106,15 @@ def test_no_progress_guard_survives_yield(client, monkeypatch, redis_worker):
     agent_worker.run_pending_once(threading.Event())
     current = client.get(f'/api/jobs/{job["id"]}').json()
     assert len(seen) == 2
-    assert current["agent_runs"][0]["status"] == "waiting"
+    assert current["agent_runs"][0]["status"] == "processing"
     assert current["agent_runs"][0]["usage"]["no_progress_rounds"] == 2
+    assert current["agent_runs"][0]["steps"][-1]["tool"] == "progress_notice"
     assert not current["quotes"]
+    agent_worker.run_pending_once(threading.Event())
+    agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    assert current["agent_runs"][0]["status"] == "succeeded"
+    assert not current["agent_runs"][0]["usage"]["idle_warning"]
 
 
 def test_price_discovery_survives_worker_yield(client, price_input, monkeypatch, redis_worker):

@@ -4,6 +4,7 @@ import threading
 import time
 import uuid
 
+import redis
 from sqlalchemy import select
 
 from .agent_checkpoints import redis_client, save_checkpoint
@@ -43,7 +44,7 @@ def run_pending_once(stop):
                         if not client.eval(RENEW, 1, key, owner):
                             lease_lost.set()
                             return
-                    except Exception:
+                    except (redis.RedisError, ConnectionError, TimeoutError):
                         lease_lost.set()
                         return
 
@@ -54,7 +55,7 @@ def run_pending_once(stop):
                     return True
                 try:
                     return client.get(key) != owner
-                except Exception:
+                except (redis.RedisError, ConnectionError, TimeoutError):
                     return True
             try:
                 from .agent_loop import locked
@@ -81,6 +82,8 @@ def worker_loop(stop):
     while not stop.is_set():
         try:
             run_pending_once(stop)
+        except (redis.RedisError, ConnectionError) as exc:
+            logger.exception("Redis connection failed; will retry: %s", exc)
         except Exception:
             logger.exception("Agent worker checkpoint or execution failed; committed progress retained")
         stop.wait(2)

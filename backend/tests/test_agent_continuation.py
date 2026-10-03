@@ -127,7 +127,7 @@ def test_failed_standard_matches_do_not_prevent_model_estimate(client, price_inp
 
 def test_compacted_checkpoint_is_bounded(client, monkeypatch):
     from types import SimpleNamespace
-    job = SimpleNamespace(requirements=[], brief="", messages=[], extraction={})
+    job = SimpleNamespace(requirements=[], brief="", messages=[], extraction={}, business_rules_version="legacy")
     steps = [{"tool": "evaluate_price", "arguments": {"line_id": "same", "price_id": i},
               "result": {"line_id": "same", "blockers": ["规则未确认"] * 20}} for i in range(500)]
     messages = agent_loop.context_messages(job, SimpleNamespace(steps=steps))
@@ -135,3 +135,61 @@ def test_compacted_checkpoint_is_bounded(client, monkeypatch):
     assert len(data["checkpoint"]) == 1
     assert data["checkpoint"][0]["arguments"]["price_id"] == 499
     assert len(messages[1]["content"]) < 12000
+
+
+def test_compacted_checkpoint_retains_failed_estimate_for_repair():
+    from types import SimpleNamespace
+    from test_estimate_pricing import plan
+    job = SimpleNamespace(requirements=[], brief="", messages=[], extraction={}, business_rules_version="legacy")
+    attempted = plan()
+    steps = [{"tool": "complete_estimate", "arguments": {"line_id": "same", "estimate": attempted},
+              "result": {"saved": False, "blockers": ["缺少公式参数：letter_cm"]}}]
+    messages = agent_loop.context_messages(job, SimpleNamespace(steps=steps))
+    checkpoint = json.loads(messages[1]["content"])["checkpoint"][0]
+    assert checkpoint["arguments"]["estimate"] == attempted
+
+
+def test_compacted_checkpoint_keeps_successful_estimate_compact():
+    from types import SimpleNamespace
+    from test_estimate_pricing import plan
+    job = SimpleNamespace(requirements=[], brief="", messages=[], extraction={}, business_rules_version="legacy")
+    steps = [{"tool": "complete_estimate", "arguments": {"line_id": "same", "estimate": plan()},
+              "result": {"saved": True, "amount": "141.60"}}]
+    messages = agent_loop.context_messages(job, SimpleNamespace(steps=steps))
+    checkpoint = json.loads(messages[1]["content"])["checkpoint"][0]
+    assert checkpoint["arguments"] == {"line_id": "same"}
+
+
+def test_compacted_checkpoint_bounds_large_failed_plan():
+    from types import SimpleNamespace
+    job = SimpleNamespace(requirements=[], brief="", messages=[], extraction={}, business_rules_version="legacy")
+    attempted = {"scope": "待审核范围" * 500, "assumptions": [
+        {"field": "width_mm", "value": "1500", "reason": "假设依据" * 300}],
+        "costs": [{"label": f"项目{i}", "rate": "100", "quantity_formula": "=1" + "+1" * 400,
+                   "reason": "费用依据" * 300} for i in range(30)]}
+    steps = [{"tool": "complete_estimate", "arguments": {"line_id": "same", "estimate": attempted},
+              "result": {"saved": False, "blockers": ["缺少公式参数：letter_cm"]}}]
+    messages = agent_loop.context_messages(job, SimpleNamespace(steps=steps))
+    checkpoint = json.loads(messages[1]["content"])["checkpoint"][0]
+    summary = checkpoint["arguments"]["estimate"]
+    assert summary["summary_only"]
+    assert summary["assumptions"][0]["value"] == "1500"
+    assert summary["omitted_costs"] > 0
+    assert len(messages[1]["content"]) < 12000
+
+
+def test_token_only_compaction_does_not_exhaust_execution_segments(client, monkeypatch):
+    from test_estimate_pricing import plan
+    job = prepared(client)
+    monkeypatch.setattr(agent_loop, "MAX_TOKENS", 1)
+    monkeypatch.setattr(agent_loop, "MAX_SEGMENTS", 1)
+    provider(monkeypatch, [
+        *[call("read_requirement", line_id="line1") for _ in range(4)],
+        call("complete_estimate", line_id="line1", estimate=plan()),
+        call("finish_quote"),
+    ])
+    result = start(client, job).json()
+    run = result["agent_runs"][0]
+    assert run["status"] == "succeeded"
+    assert run["usage"]["context_compactions"] >= 5
+    assert run["usage"]["agent_tokens"] == 60

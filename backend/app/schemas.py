@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Status = Literal["draft", "active", "inactive"]
-Unit = Literal["cm", "m", "m2", "piece", "set", "unknown"]
+Unit = Literal["cm", "m", "m2", "piece", "set", "fixed", "hour", "unknown"]
 PriceKind = Literal["standard", "suggested", "starting", "reference"]
 
 
@@ -25,6 +25,15 @@ class PriceInput(BaseModel):
     notes: str = Field(default="", max_length=10000)
     review_reason: str = Field(min_length=2, max_length=2000)
     revision: int | None = Field(default=None, ge=1)
+    included_cost_kinds: list[Literal["material", "process", "power", "bracket", "outsourcing"]] | None = Field(
+        default=None, max_length=5)
+
+    @field_validator("included_cost_kinds")
+    @classmethod
+    def distinct_coverage(cls, value):
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("已含费用类别不能重复")
+        return value
 
     @field_validator("amount", "thickness_mm")
     @classmethod

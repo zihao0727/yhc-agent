@@ -13,7 +13,8 @@ class RequirementChange(StrictModel):
     line_id: str = Field(min_length=1, max_length=50)
     field: Literal["quantity", "width_mm", "height_mm", "depth_mm", "thickness_mm",
                    "billing_length_mm", "material", "process", "language", "product",
-                   "pricing_category", "text_content"]
+                   "pricing_category", "text_content", "type_note", "difficulty", "difficulty_note", "character_count",
+                   "area_m2", "faces", "lighting", "installation_scene", "power_count", "power_note"]
     value: str | None = Field(max_length=1000)
     reason: str = Field(min_length=2, max_length=1000)
 

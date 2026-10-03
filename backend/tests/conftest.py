@@ -15,6 +15,7 @@ from app.main import app
 def isolate_customer_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(settings(), "storage_dir", tmp_path / "uploads")
     monkeypatch.setattr(settings(), "deepseek_api_key", "")
+    monkeypatch.setattr(settings(), "siliconflow_api_key", "")
     monkeypatch.setattr(settings(), "agent_background", False)
 
 

@@ -7,6 +7,7 @@ from .models import PriceItem, PricingRule, Product, SourceDocument, SourceRecor
 from .requirements_schemas import RequirementLine
 from .services import snapshot
 from .pricing_scope import category_matches, rule_scope
+from . import business_rules
 
 
 def candidate_prices(db, line, query=""):
@@ -91,6 +92,16 @@ def unit_price_usable(result):
 
 
 def calculate_line(db, line: RequirementLine, automatic=False):
+    try:
+        business_rules.validate_fees(line)
+        if line.estimate is None:
+            business_rules.validate_plan(line)
+            business_rules.validate_extra_amounts(line)
+    except ValueError as exc:
+        return {"line_id": line.id, "product": line.product, "requirement": line.model_dump(mode="json"),
+                "blockers": [str(exc)], "warnings": business_rules.warnings(line),
+                "amount": None, "unit_price": None, "unit_formula": "", "fixed_charges": "0",
+                "price": None, "formula": ""}
     if line.estimate is not None:
         from .estimate_pricing import calculate_estimate
         return calculate_estimate(db, line, calculate_line)
@@ -99,7 +110,7 @@ def calculate_line(db, line: RequirementLine, automatic=False):
         blockers.remove("需求人工确认")
     price = db.get(PriceItem, line.selected_price_id) if line.selected_price_id else None
     result = {"line_id": line.id, "product": line.product, "requirement": line.model_dump(mode="json"),
-              "blockers": blockers, "warnings": pricing_warnings(db, line, price),
+              "blockers": blockers, "warnings": [*pricing_warnings(db, line, price), *business_rules.warnings(line)],
               "amount": None, "unit_price": None, "unit_formula": "",
               "fixed_charges": str(sum((c.amount for c in line.extras if c.basis == "total"), Decimal(0))),
               "price": None, "formula": ""}
@@ -116,7 +127,7 @@ def calculate_line(db, line: RequirementLine, automatic=False):
         result.update(unit_price=str(unit.quantize(Decimal(".01"), rounding=ROUND_HALF_UP)),
                       unit_formula=f"{line.manual_unit_price} + {unit - line.manual_unit_price} = {unit}",
                       manual_price=True,
-                      warnings=[*line.uncertainties, "人工补价：" + line.manual_price_note])
+                      warnings=[*line.uncertainties, *business_rules.warnings(line), "人工补价：" + line.manual_price_note])
         if line.quantity is None:
             return result
         extra = sum((charge.amount * (line.quantity if charge.basis == "per_piece" else 1)
@@ -126,7 +137,7 @@ def calculate_line(db, line: RequirementLine, automatic=False):
             blockers.append("金额超出允许范围")
             return result
         result.update(amount=str(total), manual_price=True,
-                      warnings=[*line.uncertainties, "人工补价：" + line.manual_price_note],
+                      warnings=[*line.uncertainties, *business_rules.warnings(line), "人工补价：" + line.manual_price_note],
                       formula=f"{line.manual_unit_price} × {line.quantity} + {extra} = {total}")
         return result
     if not price:
@@ -150,6 +161,8 @@ def calculate_line(db, line: RequirementLine, automatic=False):
         blockers.append("起价或参考价不能用于标准计算")
     if price.amount is None or price.unit == "unknown":
         blockers.append("单价或计价单位未确认")
+    if business_rules.current(line) and price.unit not in ("cm", "m2"):
+        blockers.append("现场标准计价仅按厘米或平方米；其他单位需转为有依据的费用方案或人工成品价")
     if len(line.price_review_note.strip()) < 2:
         blockers.append("尚未确认规格档位、材质、工艺及附加规则的适用性")
     if line.material and price.material and line.material != price.material:
@@ -171,6 +184,16 @@ def calculate_line(db, line: RequirementLine, automatic=False):
             measure = line.width_mm * line.height_mm / Decimal(1_000_000)
     elif price.unit not in ("piece", "set"):
         blockers.append("不支持的计价单位")
+    if business_rules.current(line):
+        try:
+            if line.pricing_family == "letter" and price.unit in ("cm", "m2"):
+                measure = business_rules.letter_measure(line, price.unit)
+                blockers[:] = [b for b in blockers if b not in ("缺少每件计价长度（mm）", "缺少单件计价宽、高（mm）")]
+            elif price.unit == "m2" and line.area_m2 is not None:
+                measure = line.area_m2
+                blockers[:] = [b for b in blockers if b != "缺少单件计价宽、高（mm）"]
+        except ValueError as exc:
+            blockers.append(str(exc))
     if any(b != "单件数量" for b in blockers):
         return result
     per_piece_extra = sum((c.amount for c in line.extras if c.basis == "per_piece"), Decimal(0))
@@ -196,8 +219,10 @@ def calculate_line(db, line: RequirementLine, automatic=False):
     return result
 
 
-def build_quote(db, requirements, automatic=False):
+def build_quote(db, requirements, automatic=False, rounding="none"):
     from .component_pricing import analyze_components
+    from .pricing_diagnostics import diagnostics_for, line_resolution
+    from .pricing_strategies import strategy_snapshot
     lines = [calculate_line(db, RequirementLine.model_validate(line), automatic) for line in requirements]
     for line in lines:
         if automatic and unit_price_usable(line) and not line.get("manual_price") and not line.get("estimated"):
@@ -221,7 +246,16 @@ def build_quote(db, requirements, automatic=False):
             line["estimate_conditions"].append("成品单价包含每件附加费；整单附加费另列，不分摊至单价。")
             if line["requirement"]["quantity"] is None and not line.get("estimated"):
                 line["estimate_conditions"].append("数量未确认，仅报成品单价，未计入成品小计。")
-        line["estimate_conditions"].append("税费、运费、安装费仅按明确报价依据计入，未明确部分待核价。")
+        line["estimate_conditions"].append(business_rules.TERMS if business_rules.current(
+            RequirementLine.model_validate(line["requirement"])) else
+            "税费、运费、安装费仅按明确报价依据计入，未明确部分待核价。")
+        line["business_rules_version"] = line["requirement"].get("business_rules_version", "legacy")
+        parsed = RequirementLine.model_validate(line["requirement"])
+        line.setdefault("diagnostics", diagnostics_for(parsed, line["blockers"]))
+        line.setdefault("pricing_strategy", strategy_snapshot(parsed))
+        line["resolution"] = line_resolution(line)
+    from .quote_review import review_signals
+    review_signals(lines)
     subtotal = sum((Decimal(line["amount"]) for line in lines if line["amount"] is not None), Decimal(0))
     complete = bool(lines) and all(not line["blockers"] for line in lines)
     review_items = []
@@ -231,29 +265,46 @@ def build_quote(db, requirements, automatic=False):
         for item in line.get("estimate_review", []):
             review_items.append({"line_id": line["line_id"], "product": line["product"], **item})
         for item in line.get("estimate_costs", []):
-            review_items.append({"line_id": line["line_id"], "product": line["product"], "kind": "cost", **item})
+            review_items.append({"line_id": line["line_id"], "product": line["product"], **item,
+                                 "cost_kind": item.get("kind", "other"), "kind": "cost"})
         review_items.append({"line_id": line["line_id"], "product": line["product"], "kind": "scope",
                              "label": "报价范围", "value": line["estimate_scope"], "reason": "须审核包含及未包含费用"})
-    return {"lines": lines, "known_subtotal": str(subtotal), "total": str(subtotal) if complete else None,
+    payload = {"lines": lines, "known_subtotal": str(subtotal), "total": str(subtotal) if complete else None,
             "currency": "CNY", "complete": complete,
             "priced_count": sum(line["amount"] is not None for line in lines),
             "unit_priced_count": sum(line["unit_price"] is not None for line in lines),
             "pending_count": sum(line["amount"] is None for line in lines),
             "confirmation_items": confirmation_items(lines),
             "review_items": review_items, "has_estimates": any(line.get("estimated") for line in lines),
-            "requires_review": bool(review_items) or any(line["warnings"] for line in lines)}
+            "requires_review": bool(review_items) or any(line["warnings"] or line["review_signals"] for line in lines),
+            "resolution_counts": {status: sum(line["resolution"] == status for line in lines)
+                                  for status in ("priced", "priced_review", "unresolved", "customer_confirmation",
+                                                 "administrator_pricing", "execution_error")},
+            "measurement_contract": "measurement.v2"}
+    if any(line["business_rules_version"] == business_rules.VERSION for line in lines):
+        payload["business_rules"] = business_rules.snapshot()
+    return business_rules.round_quote(payload, rounding)
 
 
 def confirmation_items(lines):
     grouped = {}
     for line in lines:
-        for blocker in line["blockers"]:
-            owner = "报价管理员" if any(word in blocker for word in (
-                "价格", "单价", "规则", "人工", "计价单位")) else "需求方"
-            key = (owner, blocker)
+        issue = line.get("deferred_issue") if line["amount"] is None else None
+        if issue:
+            owner = "需求方" if issue["cause"] == "customer_input" else "报价管理员"
+            key = (owner, issue.get("question") or issue["reason"], issue["cause"])
             grouped.setdefault(key, []).append({"line_id": line["line_id"], "product": line["product"]})
-    return [{"owner": owner, "question": question, "lines": affected}
-            for (owner, question), affected in grouped.items()]
+            continue
+        for blocker in line["blockers"]:
+            diagnosis = next((d for d in line.get("diagnostics", []) if d["message"] == blocker), None)
+            cause = diagnosis["cause"] if diagnosis else None
+            owner = "报价管理员" if cause in ("execution_error", "catalog_gap") or any(
+                word in blocker for word in ("价格", "单价", "规则", "人工", "计价单位")) else "需求方"
+            key = (owner, blocker, cause)
+            grouped.setdefault(key, []).append({"line_id": line["line_id"], "product": line["product"]})
+    return [{"owner": owner, "question": question, "lines": affected,
+             **({"cause": cause} if cause else {})}
+            for (owner, question, cause), affected in grouped.items()]
 
 
 def quote_stale(db, quote, job):

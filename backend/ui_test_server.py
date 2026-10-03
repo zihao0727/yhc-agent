@@ -41,13 +41,19 @@ def mock_agent(messages, tools):
     initial = json.loads(messages[1]["content"])
     previous = [m for m in messages if m["role"] == "tool"]
     index = len(previous)
-    history = initial.get("history", [])
-    if (history and history[-1].get("role") == "user" and is_resume_command(history[-1].get("text", ""))
-            and all(r.get("estimate") or r.get("selected_price_id") or r.get("manual_unit_price") is not None
-                    for r in initial["requirements"])):
+    recovered = any(step["tool"] == "response_recovery" for step in initial.get("checkpoint", []))
+    if all(r.get("estimate") or r.get("selected_price_id") or r.get("manual_unit_price") is not None
+           for r in initial["requirements"]):
+        if "自动补全测试" in initial["brief"] and not recovered and not is_resume_command(
+                (initial.get("history") or [{}])[-1].get("text", "")):
+            raise deepseek.AgentResponseFailure("truncated_response",
+                                               {"finish_reason": "length", "tool_count": 1},
+                                               {"total_tokens": 17})
+        name = "finish_pending_quote" if "单价优先测试" in initial["brief"] else "finish_quote"
+        arguments = {"reason": "请补充成品数量，已先给出单价"} if name == "finish_pending_quote" else {}
         return {"role": "assistant", "content": "", "tool_calls": [{
             "id": "resume-finish", "type": "function",
-            "function": {"name": "finish_quote", "arguments": "{}"}}]}, {"total_tokens": 10}
+            "function": {"name": name, "arguments": json.dumps(arguments)}}]}, {"total_tokens": 10}
     if "自动补全测试" in initial["brief"]:
         recovered = any(step["tool"] == "response_recovery" for step in initial.get("checkpoint", []))
         if index == 1 and not recovered:
@@ -58,13 +64,13 @@ def mock_agent(messages, tools):
             name, args = "complete_estimate", {"line_id": initial["requirements"][0]["id"], "estimate": {
                 "assumptions": [{"field": "quantity", "value": "2", "reason": "测试：按两处位置暂定2件，待审核"}],
                 "costs": [
-                    {"label": "材料", "rate": "300", "quantity_formula": "=area_m2",
+                    {"label": "材料", "kind": "material", "rate": "300", "quantity_formula": "=area_m2",
+                     "rate_unit": "m2", "expected_amount": "10.80",
                      "source": "agent_estimate", "reason": "测试：按材料面积估算"},
-                    {"label": "加工组装及利润", "rate": "50", "quantity_formula": "=1",
+                    {"label": "加工组装及利润", "kind": "process", "rate": "50", "quantity_formula": "=1",
+                     "rate_unit": "piece", "expected_amount": "50",
                      "source": "agent_estimate", "reason": "测试：每件制作组装与利润估算"},
-                    {"label": "运输", "rate": "20", "quantity_formula": "=1", "basis": "total",
-                     "source": "agent_estimate", "reason": "测试：整单运输估算"},
-                ], "scope": "含材料、制作组装、利润和运输；不含税及安装，有效期7天，待审核",
+                ], "scope": "含材料、制作组装、利润；不含税、运输及现场安装，有效期7天，待审核",
             }}
         else:
             name, args = "finish_quote", {}
@@ -102,6 +108,7 @@ def main():
     config = settings()
     config.storage_dir = Path(__file__).resolve().parents[1] / ".runtime" / schema / "uploads"
     config.deepseek_api_key = ""
+    config.agent_background = False
     config.admin_token = "ui-test-local-only"
     admin = create_engine(config.database_url)
     with admin.begin() as conn:

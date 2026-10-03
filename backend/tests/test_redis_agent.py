@@ -155,3 +155,92 @@ def test_older_checkpoint_cannot_replace_newer_run(redis_worker):
     assert redis_worker.eval(agent_checkpoints.PUBLISH, 2, key, newer, 5, 10) == 1
     assert redis_worker.eval(agent_checkpoints.PUBLISH, 2, key, older, 6, 9) == 0
     assert redis_worker.get(key) == newer
+
+
+def test_idle_rounds_and_scheduling_cycles_are_not_pricing_gates(
+        client, monkeypatch, redis_worker):
+    monkeypatch.setattr(settings(), "agent_max_idle_rounds", 1)
+    monkeypatch.setattr(settings(), "agent_max_cycles", 1)
+    monkeypatch.setattr(settings(), "agent_slice_rounds", 1)
+    seen = provider(monkeypatch, [
+        call("read_requirement", line_id="line0"),
+        call("search_prices", query="没有匹配价格"),
+        call("complete_estimate", line_id="line0", estimate=plan()),
+        call("finish_quote"),
+    ])
+    job = enqueue(client, monkeypatch, 1)
+    for _ in range(4):
+        agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    run = current["agent_runs"][0]
+    assert run["status"] == "succeeded", run
+    assert len(seen) == 4
+    assert current["quotes"][0]["payload"]["total"] == "141.60"
+    assert sum(step["tool"] == "progress_notice" for step in run["steps"]) == 1
+
+
+def test_durable_extraction_usage_does_not_exhaust_pricing_budget(
+        client, monkeypatch, redis_worker, test_db):
+    monkeypatch.setattr(settings(), "agent_max_total_tokens", 100)
+    seen = provider(monkeypatch, [
+        call("complete_estimate", line_id="line0", estimate=plan()),
+        call("finish_quote"),
+    ])
+    job = enqueue(client, monkeypatch, 1)
+    with test_db.begin() as db:
+        run = db.get(AgentRun, job["agent_runs"][0]["id"])
+        run.usage = {**run.usage, "prepared": True, "extraction_tokens": 150010,
+                     "total_tokens": 150010}
+    agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    run = current["agent_runs"][0]
+    assert run["status"] == "succeeded", run
+    assert len(seen) == 2
+    assert run["usage"]["extraction_tokens"] == 150010
+    assert run["usage"]["agent_tokens"] == 20
+
+
+@pytest.mark.parametrize("counter,value,reason", [
+    ("agent_tokens", 1000000, "agent_tokens"),
+    ("response_failures", 6, "response_failures"),
+])
+def test_durable_protection_reports_specific_cause_and_preserves_state(
+        client, monkeypatch, redis_worker, test_db, counter, value, reason):
+    monkeypatch.setattr(settings(), "agent_max_total_tokens", 1000000)
+    seen = provider(monkeypatch, [])
+    job = enqueue(client, monkeypatch, 1)
+    with test_db.begin() as db:
+        run = db.get(AgentRun, job["agent_runs"][0]["id"])
+        run.usage = {**run.usage, "prepared": True, counter: value}
+    agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    run = current["agent_runs"][0]
+    assert run["status"] == "waiting", run
+    assert not seen and not current["quotes"]
+    assert run["steps"][-1]["tool"] == "execution_limit"
+    assert run["steps"][-1]["result"]["reason"] == reason
+    assert str(value) in run["message"]
+    assert current["requirements"] == job["requirements"]
+
+
+def test_uncapped_tokens_do_not_pause_and_remain_audited(
+        client, monkeypatch, redis_worker, test_db):
+    monkeypatch.setattr(settings(), "agent_max_total_tokens", 0)
+    seen = provider(monkeypatch, [
+        call("complete_estimate", line_id="line0", estimate=plan()),
+        call("finish_quote"),
+    ])
+    job = enqueue(client, monkeypatch, 1)
+    with test_db.begin() as db:
+        run = db.get(AgentRun, job["agent_runs"][0]["id"])
+        run.usage = {**run.usage, "prepared": True, "agent_tokens": 1008528,
+                     "total_tokens": 1008528}
+    agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    run = current["agent_runs"][0]
+    assert run["status"] == "succeeded"
+    assert len(seen) == 2
+    assert run["usage"]["agent_tokens"] == 1008548
+    assert run["usage"]["total_tokens"] == 1008548
+    assert current["quotes"][0]["payload"]["total"] == "141.60"
+    assert not any(step["tool"] == "execution_limit" for step in run["steps"])

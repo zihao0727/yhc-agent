@@ -1,12 +1,14 @@
 import csv
 import io
+import json
 import uuid
 import time
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
+import redis
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
@@ -18,7 +20,9 @@ from .database import get_db
 from .models import AgentRun, CustomerFile, ExtractionRun, PriceItem, PricingRule, QuoteDraft, RequirementJob, now
 from .pricing_scope import rule_scope
 from .quote_engine import build_quote, candidate_prices, missing_requirements, quote_stale
-from .requirements_schemas import ApprovalInput, ModelKeyInput, QuoteInput, RequirementLine, RequirementsUpdate, RunInput
+from .requirements_schemas import ApprovalInput, ModelKeyInput, QuoteInput, RequirementLine, RequirementsUpdate, RunInput, PricingPolicyInput
+from . import business_rules
+from .customer_excel import MEDIA_TYPE as EXCEL_MEDIA_TYPE
 from .schemas import DeleteInput
 from .services import log_change, snapshot
 
@@ -53,6 +57,15 @@ def view_quote(db, quote, job):
     return {**snapshot(quote), "outdated": quote_stale(db, quote, job)}
 
 
+def public_usage(usage, job=None, run=None):
+    data = {key: value for key, value in usage.items()
+            if key not in ("extraction_checkpoint", "work_state")}
+    if job is not None and run is not None:
+        from .agent_work_state import deferred_lines
+        data["deferred_requirements"] = deferred_lines(job, run)
+    return data
+
+
 def view_job(db, job, detail=False):
     data = snapshot(job)
     data["line_count"] = len(job.requirements)
@@ -66,9 +79,10 @@ def view_job(db, job, detail=False):
                 progress = read_checkpoint(job.id)
                 if progress and progress["revision"] == job.revision:
                     data["pricing_progress"] = progress
-            except Exception:
+            except (redis.RedisError, ValueError, KeyError, TypeError):
                 pass  # SQL remains available while the worker repairs Redis.
-        data["agent_runs"] = [snapshot(r) for r in db.scalars(select(AgentRun).where(
+        data["agent_runs"] = [{**snapshot(r), "usage": public_usage(r.usage, job, r)}
+                              for r in db.scalars(select(AgentRun).where(
             AgentRun.job_id == job.id).order_by(AgentRun.id.desc()).limit(10))]
         data["files"] = [public_file(f) for f in db.scalars(select(CustomerFile).where(CustomerFile.job_id == job.id).order_by(CustomerFile.id))]
         data["runs"] = [snapshot(r) for r in db.scalars(select(ExtractionRun).where(ExtractionRun.job_id == job.id).order_by(ExtractionRun.id.desc()).limit(20))]
@@ -92,8 +106,8 @@ def job_progress(job_id: int, db: DB, run_id: int = 0, after: int = Query(defaul
             candidate = read_checkpoint(job.id)
             if candidate and candidate["revision"] == job.revision:
                 progress = candidate
-        except Exception:
-            pass
+        except (redis.RedisError, ValueError, KeyError, TypeError):
+            pass  # Fall back to recomputing from SQL.
     if progress is None:
         from decimal import Decimal
         from .quote_engine import calculate_line
@@ -108,7 +122,7 @@ def job_progress(job_id: int, db: DB, run_id: int = 0, after: int = Query(defaul
     result = {"id": job.id, "revision": job.revision, "status": job.status,
               "pricing_progress": progress, "run": None, "server_time": time.time()}
     if run:
-        usage = run.usage
+        usage = public_usage(run.usage, job, run)
         phase = usage.get("phase", "queued") if run.status == "processing" else run.status
         offset = min(after, len(run.steps)) if run.id == run_id else 0
         latest = run.steps[-1] if run.steps else None
@@ -157,6 +171,31 @@ def clear_model():
     return model_config()
 
 
+@router.get("/embedding-config")
+def embedding_config():
+    from .semantic_search import get_key
+    return {"configured": bool(get_key()), "model": settings().siliconflow_embedding_model,
+            "provider": "硅基流动", "environment_managed": bool(settings().siliconflow_api_key)}
+
+
+@router.put("/embedding-config")
+def configure_embeddings(data: ModelKeyInput):
+    from .semantic_search import save_key
+    if settings().siliconflow_api_key:
+        raise HTTPException(409, "向量密钥由环境变量管理，请修改后端配置")
+    save_key(data.api_key)
+    return embedding_config()
+
+
+@router.delete("/embedding-config")
+def clear_embeddings():
+    from .semantic_search import key_path
+    if settings().siliconflow_api_key:
+        raise HTTPException(409, "向量密钥由环境变量管理，请修改后端配置")
+    key_path().unlink(missing_ok=True)
+    return embedding_config()
+
+
 @router.get("/jobs")
 def jobs(db: DB, q: str = Query("", max_length=150), page: int = Query(1, ge=1)):
     stmt = select(RequirementJob)
@@ -172,9 +211,10 @@ def jobs(db: DB, q: str = Query("", max_length=150), page: int = Query(1, ge=1))
 def create_job(db: DB, title: Annotated[str, Form(max_length=150)],
                customer: Annotated[str, Form(max_length=150)] = "",
                brief: Annotated[str, Form(max_length=8000)] = "",
-               files: Annotated[list[UploadFile], File()] = []):
+               files: Annotated[list[UploadFile], File()] = [],
+               business_rules_version: Annotated[Literal["legacy", "2026-09-23.v1"], Form()] = business_rules.VERSION):
     if not title.strip() or len(files) > 6 or (not files and not brief.strip()):
-        raise HTTPException(422, "填写任务名称，并提供需求文字或图片/PDF，文件最多 6 个")
+        raise HTTPException(422, "填写任务名称，并提供需求文字或图片/PDF/XLSX，文件最多 6 个")
     prepared = []
     try:
         total_size, total_pages = 0, 0
@@ -184,13 +224,15 @@ def create_job(db: DB, title: Annotated[str, Form(max_length=150)],
             result = prepare_file(data, upload.filename or "customer-file")
             prepared.append(result)
             total_size += result["byte_size"]
-            total_pages += result["page_count"]
+            if result["media_type"] != EXCEL_MEDIA_TYPE:
+                total_pages += result["page_count"]
             if total_size > 50 * 1024 * 1024 or total_pages > settings().max_job_pages:
-                raise FileRejected("任务文件合计不能超过 50MB 或 20 页")
+                raise FileRejected("任务文件合计不能超过50MB；图片/PDF合计不能超过20页（不含Excel自动分页）")
             if result["sha256"] in hashes:
                 raise FileRejected("同一任务不能重复上传相同文件")
             hashes.add(result["sha256"])
-        job = RequirementJob(title=title.strip(), customer=customer.strip(), brief=brief.strip())
+        job = RequirementJob(title=title.strip(), customer=customer.strip(), brief=brief.strip(),
+                             business_rules_version=business_rules_version)
         db.add(job)
         db.flush()
         for item in prepared:
@@ -215,6 +257,34 @@ def get_job(job_id: int, db: DB):
     return view_job(db, job_for(db, job_id), True)
 
 
+@router.put("/jobs/{job_id}/pricing-policy")
+def adopt_policy(job_id: int, data: PricingPolicyInput, db: DB):
+    job = job_for(db, job_id, True)
+    check_revision(job, data.revision)
+    before = snapshot(job)
+    job.business_rules_version = business_rules.VERSION
+    job.requirements = [{**line, "business_rules_version": business_rules.VERSION, "confirmed": False}
+                        for line in job.requirements]
+    job.revision += 1
+    job.status = "needs_review"
+    log_change(db, job, "pricing_policy", data.reason, before)
+    db.commit()
+    return view_job(db, job, True)
+
+
+@router.get("/pricing-policy")
+def pricing_policy():
+    return business_rules.snapshot()
+
+
+@router.get("/pricing-strategies")
+def pricing_strategies():
+    from .pricing_strategies import STRATEGIES
+    return {"version": "measurement.v2",
+            "strategies": [{"key": key, **value} for key, value in STRATEGIES.items()],
+            "business_rules": business_rules.snapshot()}
+
+
 @router.delete("/jobs/{job_id}")
 def delete_job(job_id: int, data: DeleteInput, db: DB):
     job = job_for(db, job_id, True)
@@ -230,7 +300,7 @@ def delete_job(job_id: int, data: DeleteInput, db: DB):
         try:
             cached = list(client.scan_iter(match=f"{prefix}:revision:*"))
             client.delete(prefix, *cached)
-        except Exception as exc:
+        except (redis.RedisError, ConnectionError, TimeoutError) as exc:
             raise HTTPException(503, "暂时无法清理会话缓存，请稍后重试删除") from exc
     log_change(db, job, "delete", data.reason, snapshot(job))
     for model in (QuoteDraft, AgentRun, ExtractionRun, CustomerFile):
@@ -253,16 +323,18 @@ def append_files(job_id: int, db: DB, revision: Annotated[int, Form()],
         if not files or len(existing) + len(files) > 6:
             raise FileRejected("每个会话累计最多 6 个文件")
         hashes = {f.sha256 for f in existing}
-        size, pages = sum(f.byte_size for f in existing), sum(f.page_count for f in existing)
+        size = sum(f.byte_size for f in existing)
+        pages = sum(f.page_count for f in existing if f.media_type != EXCEL_MEDIA_TYPE)
         for upload in files:
             item = prepare_file(upload.file.read(settings().max_upload_bytes + 1), upload.filename or "customer-file")
             prepared.append(item)
             size += item["byte_size"]
-            pages += item["page_count"]
+            if item["media_type"] != EXCEL_MEDIA_TYPE:
+                pages += item["page_count"]
             if item["sha256"] in hashes:
                 raise FileRejected("该文件已在当前会话中")
             if size > 50 * 1024 * 1024 or pages > settings().max_job_pages:
-                raise FileRejected("会话文件合计不能超过 50MB 或 20 页")
+                raise FileRejected("会话文件合计不能超过50MB；图片/PDF合计不能超过20页（不含Excel自动分页）")
             hashes.add(item["sha256"])
         before = snapshot(job)
         added = [CustomerFile(job_id=job_id, **item) for item in prepared]
@@ -300,6 +372,32 @@ def preview(file_id: int, page: int, db: DB):
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
+@router.get("/customer-files/{file_id}/source/{page}")
+def customer_source(file_id: int, page: int, db: DB):
+    from .customer_excel import MEDIA_TYPE, page_source
+    file = db.get(CustomerFile, file_id)
+    if not file or not 1 <= page <= file.page_count or file.media_type != MEDIA_TYPE:
+        raise HTTPException(404, "Excel来源页不存在")
+    source = page_source(storage_path(file.storage_key), page)
+    for image in source["images"]:
+        image["url"] = f"/api/customer-files/{file_id}/images/{image['storage']}"
+        image.pop("storage")
+    return source
+
+
+@router.get("/customer-files/{file_id}/images/{name}")
+def customer_drawing(file_id: int, name: str, db: DB):
+    import re
+    from .customer_excel import MEDIA_TYPE
+    file = db.get(CustomerFile, file_id)
+    if not file or file.media_type != MEDIA_TYPE or not re.fullmatch(r"excel-image-\d+\.png", name):
+        raise HTTPException(404, "图纸不存在")
+    path = storage_path(file.storage_key) / name
+    if not path.is_file():
+        raise HTTPException(404, "图纸不存在")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
 @router.post("/jobs/{job_id}/extract")
 def extract_job(job_id: int, data: RunInput, db: DB):
     job = job_for(db, job_id, True)
@@ -311,7 +409,7 @@ def extract_job(job_id: int, data: RunInput, db: DB):
     if not deepseek.get_key():
         raise HTTPException(503, "尚未配置 DeepSeek API Key，可先手动整理需求")
     files = list(db.scalars(select(CustomerFile).where(CustomerFile.job_id == job.id).order_by(CustomerFile.id)))
-    if sum(f.page_count for f in files) > settings().max_job_pages:
+    if sum(f.page_count for f in files if f.media_type != EXCEL_MEDIA_TYPE) > settings().max_job_pages:
         raise HTTPException(422, "文件页数超过限制")
     before = snapshot(job)
     run = ExtractionRun(job_id=job.id, model=settings().deepseek_model, input_revision=job.revision)
@@ -345,7 +443,8 @@ def extract_job(job_id: int, data: RunInput, db: DB):
     if run.status != "processing":
         raise HTTPException(409, "此次识别已失效，结果未覆盖当前需求")
     job.extraction = result.model_dump(mode="json")
-    job.requirements = [RequirementLine(id=uuid.uuid4().hex[:16], **line.model_dump()).model_dump(mode="json")
+    job.requirements = [RequirementLine(id=uuid.uuid4().hex[:16], business_rules_version=job.business_rules_version,
+                                       **line.model_dump()).model_dump(mode="json")
                         for line in result.lines]
     messages = list(job.messages)
     if data.supplementary_text:
@@ -402,7 +501,7 @@ def agent_job(job_id: int, data: RunInput, db: DB):
         from .agent_checkpoints import redis_client
         try:
             redis_client().ping()
-        except Exception:
+        except (redis.RedisError, ConnectionError, TimeoutError):
             raise HTTPException(503, "Redis 未连接，未启动报价；请检查服务后重试") from None
     try:
         intent = resolve_agent_intent(bool(job.requirements), data.supplementary_text,
@@ -454,12 +553,37 @@ def update_requirements(job_id: int, data: RequirementsUpdate, db: DB):
     check_revision(job, data.revision)
     if len({line.id for line in data.lines}) != len(data.lines):
         raise HTTPException(422, "需求行编号不能重复")
-    valid_files = {f.id: f.page_count for f in db.scalars(select(CustomerFile).where(CustomerFile.job_id == job.id))}
+    valid_files = {f.id: f for f in db.scalars(select(CustomerFile).where(CustomerFile.job_id == job.id))}
+    excel_sources = {}
     for line in data.lines:
+        line.business_rules_version = job.business_rules_version
+        from .estimate_evidence import validate_estimate_evidence
+        try:
+            validate_estimate_evidence(line, valid_files)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         for evidence in [*line.evidence, *line.quantity_evidence, *line.dimension_evidence,
-                         *(e for component in line.components for e in component.evidence)]:
-            if evidence.file_id not in valid_files or evidence.page > valid_files[evidence.file_id]:
+                         *(e for measurement in line.source_measurements for e in measurement.evidence),
+                         *(e for component in line.components for e in component.evidence),
+                         *(e for group in line.letter_groups for e in group.evidence)]:
+            if evidence.file_id not in valid_files or evidence.page > valid_files[evidence.file_id].page_count:
                 raise HTTPException(422, "需求引用了不属于当前任务的来源")
+            from .customer_excel import MEDIA_TYPE, page_source, validate_evidence
+            source_file = valid_files[evidence.file_id]
+            if source_file.media_type == MEDIA_TYPE:
+                key = (evidence.file_id, evidence.page)
+                if key not in excel_sources:
+                    excel_sources[key] = page_source(storage_path(source_file.storage_key), evidence.page)
+                try:
+                    validate_evidence(evidence, excel_sources[key])
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+        from .quantity_validation import validate_measurement_sources
+        try:
+            validate_measurement_sources(line, {key: json.dumps(source, ensure_ascii=False)
+                                                for key, source in excel_sources.items()})
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     before = snapshot(job)
     job.requirements = [line.model_dump(mode="json") for line in data.lines]
     job.status = "ready" if data.lines and all(not missing_requirements(line) for line in data.lines) else "needs_review"
@@ -544,8 +668,13 @@ def calculate_quote(job_id: int, data: QuoteInput, db: DB):
     check_revision(job, data.revision)
     if not job.requirements:
         raise HTTPException(422, "请先整理至少一条需求")
+    if job.business_rules_version == business_rules.VERSION:
+        try:
+            data.terms = business_rules.validate_terms(data.terms)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     has_estimates = any(line.get("estimate") for line in job.requirements)
-    payload = build_quote(db, job.requirements, automatic=has_estimates)
+    payload = build_quote(db, job.requirements, automatic=has_estimates, rounding=data.rounding)
     payload.update(customer=job.customer, title=job.title)
     if has_estimates:
         payload["generated_by"] = "agent"
@@ -572,14 +701,18 @@ def approve_quote(quote_id: int, data: ApprovalInput, db: DB):
     if quote_stale(db, quote, job):
         raise HTTPException(409, "需求或价格已变化，请重新计算")
     if not data.confirmed_commercial_terms:
-        raise HTTPException(422, "请确认税费、运费、安装费及报价条款")
+        raise HTTPException(422, "请确认费用包含/排除范围及报价条款")
     if quote.payload.get("has_estimates") and not data.confirmed_estimates:
         raise HTTPException(422, "请逐项审核并明确确认Agent补全参数、估算费用和报价范围")
     if quote.payload.get("generated_by") == "agent" and not data.terms:
-        raise HTTPException(422, "Agent 草稿需补充正式税费、运费、安装费及有效期条款后批准")
+        raise HTTPException(422, "Agent 草稿需补充正式费用范围及有效期条款后批准")
     before = snapshot(quote)
     if data.terms:
-        quote.terms = data.terms
+        try:
+            quote.terms = (business_rules.validate_terms(data.terms)
+                           if quote.payload.get("business_rules") else data.terms)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     quote.status, quote.approval_note, quote.approved_at = "approved", data.note, now()
     log_change(db, quote, "approve", data.note, before)
     db.commit()
@@ -592,9 +725,9 @@ def csv_safe(value):
 
 
 @router.get("/quotes/{quote_id}/export")
-def export_quote(quote_id: int, db: DB):
+def export_quote(quote_id: int, db: DB, audience: Literal["customer", "review"] = "customer"):
     quote = db.get(QuoteDraft, quote_id)
-    if not quote or quote.status != "approved":
+    if not quote or (audience == "customer" and quote.status != "approved"):
         raise HTTPException(409, "仅已批准的报价可以导出")
     job = job_for(db, quote.job_id)
     if quote_stale(db, quote, job):
@@ -603,21 +736,51 @@ def export_quote(quote_id: int, db: DB):
     writer = csv.writer(out)
     writer.writerow(["报价编号", f"Q{quote.id:06d}", "版本", quote.version])
     writer.writerow(["项目", csv_safe(quote.payload["title"]), "客户", csv_safe(quote.payload["customer"])])
-    writer.writerow(["产品", "文字内容", "材质", "规格(mm)", "数量", "金额(CNY)"])
+    writer.writerow(["用途", "内部审核版（不可作为正式报价）" if audience == "review" else "客户报价",
+                     "规则版本", csv_safe(quote.payload.get("business_rules", {}).get("version", "legacy"))])
+    writer.writerow(["产品", "文字内容", "材质", "规格(mm)", "数量", "金额(CNY)", "类型备注", "工艺难度备注"])
     for line in quote.payload["lines"]:
         requirement = line.get("effective_requirement", line["requirement"])
         writer.writerow([csv_safe(line["product"]), csv_safe(requirement["text_content"]),
                          csv_safe(requirement["material"]),
                          f'{requirement["width_mm"] or ""} x {requirement["height_mm"] or ""}',
-                         requirement["quantity"], line["amount"]])
+                         requirement["quantity"], line["amount"], csv_safe(requirement.get("type_note")),
+                         csv_safe(requirement.get("difficulty_note") or
+                                  (requirement.get("difficulty") if requirement.get("difficulty") != "unknown" else "未标注"))])
+        if audience == "review":
+            import json
+            writer.writerow(["计价过程", csv_safe(line.get("formula")), "单价依据", csv_safe(line.get("unit_formula"))])
+            writer.writerow(["原始需求", csv_safe(json.dumps(line["requirement"], ensure_ascii=False))])
+            for evidence in line["requirement"].get("evidence", []):
+                writer.writerow(["需求来源", evidence["file_id"], evidence["page"],
+                                 csv_safe(evidence.get("sheet")), csv_safe(evidence.get("cell")), csv_safe(evidence["text"])])
+            for cost in line.get("estimate_costs", []):
+                writer.writerow(["费用依据", csv_safe(cost["label"]), csv_safe(cost.get("kind")),
+                                 csv_safe(cost["source"]), cost.get("reference_id"), cost.get("reference_revision"),
+                                 csv_safe(cost.get("resolved_formula")), csv_safe(cost["reason"])])
+                writer.writerow(["费用校对", csv_safe(cost.get("rate_unit", "unknown")),
+                                 cost.get("expected_amount", ""), csv_safe(cost.get("measurement_note"))])
+            if line.get("price"):
+                writer.writerow(["价格依据", csv_safe(json.dumps(line["price"], ensure_ascii=False))])
+            for item in [*line["blockers"], *line.get("warnings", [])]:
+                writer.writerow(["待复核", csv_safe(item)])
+            for item in line.get("review_signals", []):
+                writer.writerow(["计价风险", csv_safe(item["code"]), csv_safe(item["message"])])
+            for item in line.get("estimate_review", []):
+                writer.writerow(["采用参数", csv_safe(item.get("path", item["field"])),
+                                 csv_safe(item.get("mode", "fill")), csv_safe(item.get("original")),
+                                 csv_safe(item.get("value")), csv_safe(item.get("reason"))])
     writer.writerow(["合计(CNY)", quote.payload["total"]])
+    if quote.payload.get("rounding") not in (None, "none"):
+        writer.writerow(["取整前金额", quote.payload["unrounded_total"], "取整策略", quote.payload["rounding"],
+                         "取整调整", quote.payload["rounding_adjustment"]])
     writer.writerow(["报价条款", csv_safe(quote.terms)])
-    if quote.payload.get("has_estimates"):
+    if quote.payload.get("has_estimates") and (audience == "review" or not quote.payload.get("business_rules")):
         writer.writerow(["已审核的补全与估价清单"])
         for item in quote.payload.get("review_items", []):
             writer.writerow([csv_safe(item["product"]), csv_safe(item["label"]),
                              csv_safe(item.get("value", item.get("amount", ""))),
                              csv_safe(item.get("source", "")), csv_safe(item.get("reason", ""))])
     return Response(out.getvalue().encode("utf-8-sig"), media_type="text/csv",
-                    headers={"Content-Disposition": f'attachment; filename="quote-{quote.id}-v{quote.version}.csv"',
+                    headers={"Content-Disposition": f'attachment; filename="quote-{quote.id}-v{quote.version}-{audience}.csv"',
                              "Cache-Control": "no-store"})

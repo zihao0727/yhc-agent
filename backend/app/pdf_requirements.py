@@ -50,7 +50,13 @@ def validate_rows(result, texts):
                 continue
             raw = row["text"]
             dimensions = outer_dimensions(raw)
-            if len(dimensions) > 1:
+            image_fields = {e.field for e in line.dimension_evidence if e.source == "image" and e.value is not None
+                            and e.file_id == file_id and e.page == page}
+            if image_fields.intersection({"width_mm", "height_mm"}):
+                if dimensions and any(w != line.width_mm or h != line.height_mm for w, h in dimensions):
+                    line.uncertainties = list(dict.fromkeys([*line.uncertainties,
+                        "图纸尺寸优先于本行表格尺寸，原文差异保留待审核"]))[:20]
+            elif len(dimensions) > 1:
                 line.width_mm = line.height_mm = None
                 line.uncertainties = [*line.uncertainties, "同一行尺寸栏与项目特征存在不同尺寸，须确认后计价"][:20]
             elif dimensions:

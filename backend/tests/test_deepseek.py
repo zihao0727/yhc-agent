@@ -9,11 +9,33 @@ from app.customer_files import prepare_file
 from test_requirements import png_bytes
 
 
-def configure_transport(monkeypatch, handler):
+def configure_transport(monkeypatch, handler, auto_excel_plan=True):
     original = httpx.Client
     monkeypatch.setattr(deepseek, "get_key", lambda: "fake-test-key")
+    def route(request):
+        payload = json.loads(request.content)
+        content = payload["messages"][1]["content"] if len(payload["messages"]) > 1 else None
+        try:
+            data = json.loads(content) if isinstance(content, str) else {}
+        except ValueError:
+            data = {}
+        if auto_excel_plan and data.get("task") == "select_excel_skills":
+            plans = []
+            for sheet in data["sheets"]:
+                aliases = {"product": {"产品名称", "名称"}, "item": {"序号"}, "quantity": {"数量"},
+                           "unit": {"单位"}, "type_note": {"类型备注"}, "difficulty": {"工艺难度备注"}}
+                header = next((row for row in sheet["sample_rows"] if any(
+                    cell["value"] in aliases["product"] for cell in row["cells"])), None)
+                columns = {field: cell["cell"] for field, names in aliases.items()
+                           for cell in (header["cells"] if header else []) if cell["value"] in names}
+                plans.append({"sheet": sheet["sheet"],
+                    "skill": "excel-drawing-list" if sheet["image_count"] else "excel-quantity-list",
+                    "header_row": header["row"] if header else None, "columns": columns, "reason": "测试结构规划"})
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                "message": {"content": json.dumps({"sheets": plans})}}]})
+        return handler(request)
     monkeypatch.setattr(deepseek.httpx, "Client",
-                        lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+                        lambda **kwargs: original(transport=httpx.MockTransport(route), **kwargs))
 
 
 def file_fixture():

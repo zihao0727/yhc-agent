@@ -56,7 +56,8 @@ def test_all_tools_remain_available_after_repeated_searches(client, monkeypatch)
     def turn(messages, tools):
         nonlocal count
         count += 1
-        assert tools == agent_loop.TOOLS
+        assert tools == [tool for tool in agent_loop.TOOLS
+                         if tool["function"]["name"] != "search_prices_semantic"]
         if count <= 14:
             return call("search_prices", query=f"query-{count}"), {}
         assert "search_prices" in [t["function"]["name"] for t in tools]

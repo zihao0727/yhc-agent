@@ -19,7 +19,7 @@ def test_pdf_pages_are_extracted_separately_with_native_text(monkeypatch):
         body = json.loads(request.content)
         parts = body["messages"][1]["content"]
         images = [p for p in parts if p["type"] == "image_url"]
-        assert len(images) == 1
+        assert len(images) == 5  # Full page plus four crops, including short/empty text layers.
         page = len(seen) + 1
         assert any(f"第{page}页 原始表格内容" in p.get("text", "") for p in parts)
         seen.append(body)
@@ -110,6 +110,35 @@ def test_source_row_coverage_and_conflicting_dimensions():
     assert checked.lines[0].uncertainties
     assert checked.lines[1].source_item == "20"
     assert checked.lines[1].quantity is None
+
+
+def test_explicit_diagram_dimensions_win_but_table_conflict_is_retained():
+    from app.pdf_requirements import validate_rows
+    from app.requirements_schemas import ExtractionResult
+    text = "1 门牌\n尺寸300*200\n2 其他牌\n尺寸100*100"
+    result = ExtractionResult.model_validate({"lines": [{
+        "source_item": "1", "product": "门牌", "width_mm": 320, "height_mm": 200,
+        "evidence": [{"file_id": 1, "page": 1, "text": "表格300*200，图纸320*200"}],
+        "dimension_evidence": [{"file_id": 1, "page": 1, "source": "image",
+                                "field": "width_mm", "value": 320, "text": "320mm"}]}]})
+    line = validate_rows(result, {(1, 1): text}).lines[0]
+    assert line.width_mm == 320
+    assert any("图纸尺寸优先" in warning for warning in line.uncertainties)
+    assert "表格300*200" in line.evidence[0].text
+
+
+def test_unknown_image_dimension_cannot_override_conflicting_pdf_table_dimensions():
+    from app.pdf_requirements import validate_rows
+    from app.requirements_schemas import ExtractionResult
+    text = "1 门牌\n尺寸300*200\n320*200\n2 其他牌\n尺寸100*100"
+    result = ExtractionResult.model_validate({"lines": [{
+        "source_item": "1", "width_mm": 300, "height_mm": 200,
+        "evidence": [{"file_id": 1, "page": 1, "text": "门牌"}],
+        "dimension_evidence": [{"file_id": 1, "page": 1, "field": "width_mm",
+                                "value": None, "text": "标注不清晰", "source": "image"}]}]})
+    line = validate_rows(result, {(1, 1): text}).lines[0]
+    assert line.width_mm is None and line.height_mm is None
+    assert any("不同尺寸" in warning for warning in line.uncertainties)
 
 
 def test_last_page_embedded_row_number_is_not_lost():

@@ -40,7 +40,8 @@ def pdf_bytes():
 
 
 def create_job(client, filename="需求.png", data=None):
-    response = client.post("/api/jobs", data={"title": "测试门牌", "customer": "测试客户", "brief": "严格按标注"},
+    response = client.post("/api/jobs", data={"title": "测试门牌", "customer": "测试客户", "brief": "严格按标注",
+                                             "business_rules_version": "legacy"},
                            files=[("files", (filename, data if data is not None else png_bytes(), "application/octet-stream"))])
     assert response.status_code == 201, response.text
     return response.json()

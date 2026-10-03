@@ -1,4 +1,5 @@
 import secrets
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -16,6 +17,14 @@ from .models import AuditLog, Category, PriceItem, PriceRevision, PricingRule, P
 from .schemas import DeleteInput, PriceInput, RuleInput, Status
 from .services import log_change, product_for, snapshot
 from .upload_limits import RequestSizeLimit
+
+# Uvicorn only configures its own loggers; app.* INFO records are otherwise dropped.
+_app_logger = logging.getLogger("app")
+if not _app_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _app_logger.addHandler(_handler)
+    _app_logger.setLevel(logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -110,6 +119,11 @@ def price_view(db, item, detail=False):
     category = db.get(Category, product.category_id)
     data.update(product=product.name, category=category.name, category_id=category.id,
                 source=source_info(db, item.source_record_id, item.source_cell))
+    from .estimate_pricing import catalog_coverage
+    try:
+        data["included_cost_kinds"] = catalog_coverage(item.attributes)
+    except ValueError:
+        data["included_cost_kinds"] = None
     if not detail:
         data.pop("attributes")
     return data
@@ -138,7 +152,9 @@ def prices(db: DB, q: str = Query("", max_length=200), category_id: int | None =
 @app.post("/api/prices", dependencies=AUTH, status_code=201)
 def create_price(data: PriceInput, db: DB):
     product = product_for(db, data.category, data.product)
-    item = PriceItem(product_id=product.id, **data.model_dump(exclude={"category", "product", "revision"}))
+    item = PriceItem(product_id=product.id, **data.model_dump(
+        exclude={"category", "product", "revision", "included_cost_kinds"}),
+        attributes={"included_cost_kinds": data.included_cost_kinds or []})
     db.add(item)
     log_change(db, item, "create", data.review_reason)
     db.commit()
@@ -162,8 +178,11 @@ def update_price(item_id: int, data: PriceInput, db: DB):
         raise HTTPException(409, "版本已变化，请刷新后重试")
     before = snapshot(item)
     item.product_id = product_for(db, data.category, data.product).id
-    for key, value in data.model_dump(exclude={"category", "product", "revision"}).items():
+    for key, value in data.model_dump(
+            exclude={"category", "product", "revision", "included_cost_kinds"}).items():
         setattr(item, key, value)
+    if data.included_cost_kinds is not None:
+        item.attributes = {**(item.attributes or {}), "included_cost_kinds": data.included_cost_kinds}
     # Explicit increment also records a review which did not change the amount.
     item.revision += 1
     log_change(db, item, "update", data.review_reason, before)

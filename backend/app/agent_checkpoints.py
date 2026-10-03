@@ -4,6 +4,7 @@ import time
 from decimal import Decimal
 
 import redis
+from redis import ConnectionPool
 
 from .config import settings
 from .quote_engine import calculate_line
@@ -23,10 +24,20 @@ redis.call('set', KEYS[1], KEYS[2])
 return 1
 """
 
+_pool = None
+
 
 def redis_client():
-    return redis.Redis.from_url(settings().redis_url, decode_responses=True,
-                               socket_connect_timeout=3, socket_timeout=5)
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool.from_url(
+            settings().redis_url,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=5,
+            max_connections=20
+        )
+    return redis.Redis(connection_pool=_pool)
 
 
 def checkpoint_key(job_id):
