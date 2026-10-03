@@ -10,6 +10,8 @@ $env:UI_TEST_SCHEMA = $schema
 $env:API_TARGET = "http://127.0.0.1:8001"
 $python = Join-Path $root ".venv/Scripts/python.exe"
 $node = (Get-Command node.exe).Source
+& $python (Join-Path $root "scripts/ui-fixtures.py")
+if ($LASTEXITCODE -ne 0) { throw "Fixture generation failed." }
 $api = $null
 $web = $null
 try {
