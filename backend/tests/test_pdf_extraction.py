@@ -11,6 +11,8 @@ from test_requirements import pdf_bytes
 
 
 def test_pdf_pages_are_extracted_separately_with_native_text(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings(), "pdf_region_rows", 1)
     file = SimpleNamespace(id=41, **prepare_file(pdf_bytes(), "drawing.pdf"))
     seen = []
     monkeypatch.setattr(deepseek, "pdf_page_text", lambda f, p: f"第{p}页 原始表格内容")

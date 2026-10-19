@@ -19,9 +19,16 @@ COMMON = "excel-source-contract"
 MAX_GENERATED = 32
 MAX_CREATIONS_PER_FILE = 2
 CREATE_LOCK = threading.Lock()
-Column = Literal["item", "product", "quantity", "unit", "type_note", "difficulty",
+Column = Literal["item", "code", "product", "quantity", "unit", "type_note", "difficulty",
                  "material", "process", "dimensions", "notes"]
 Layout = Literal["row_table", "multi_level_header", "transposed", "matrix", "multi_block", "mixed"]
+DESCRIPTIVE_COLUMNS = {"material", "process", "dimensions", "notes"}
+
+
+class PlanValidationError(ValueError):
+    def __init__(self, fields):
+        self.fields = fields
+        super().__init__("Excel解析规划来源校验失败")
 
 
 class SkillMetadata(StrictModel):
@@ -44,7 +51,7 @@ class SheetPlan(StrictModel):
     layout: Layout = "row_table"
     purpose: Literal["customer_requirements", "price_reference", "historical_quote"] = "customer_requirements"
     header_row: int | None = Field(default=None, ge=1, le=2000)
-    columns: dict[Column, str] = Field(default_factory=dict, max_length=10)
+    columns: dict[Column, str] = Field(default_factory=dict, max_length=11)
     reason: str = Field(min_length=2, max_length=500)
     skill_origin: Literal["builtin", "model"] = "builtin"
     skill_revision: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
@@ -113,24 +120,61 @@ def validate_plan(plan, pages, skills):
     sheets = {page["sheet"] for page in pages}
     if {item.sheet for item in plan.sheets} != sheets or len(plan.sheets) != len(sheets):
         raise ValueError("Excel解析规划必须逐一覆盖实际工作表且不能重复")
-    for item in plan.sheets:
+    errors = []
+    for index, item in enumerate(plan.sheets):
         if item.skill not in skills or item.skill == COMMON:
             if item.skill != "create":
                 raise ValueError("Excel解析Skill不存在")
         cells = {cell["cell"]: cell for page in pages if page["sheet"] == item.sheet
                  for row in page["rows"] for cell in row["cells"]}
+        def invalid(field, kind):
+            errors.append({"path": f"sheets.{index}.{field}", "type": kind})
+
         if item.columns and item.header_row is None:
-            raise ValueError("列映射必须有实际表头行")
+            invalid("header_row", "missing_header_row")
         for address in set(item.columns.values()):
             fields = {field for field, cell in item.columns.items() if cell == address}
-            if len(fields) > 1 and not fields <= {"material", "process"}:
-                raise ValueError("除明确的材质工艺合并列外，不能把同一列作为不同字段")
-        for address in item.columns.values():
+            # A specification cell can describe multiple facts, never multiple scalar roles.
+            if len(fields) > 1 and not fields <= DESCRIPTIVE_COLUMNS:
+                for field in sorted(fields):
+                    invalid(f"columns.{field}", "conflicting_scalar_mapping")
+        for field, address in item.columns.items():
             if not re.fullmatch(r"[A-Z]{1,2}[1-9][0-9]{0,3}", address) or address not in cells:
-                raise ValueError("Skill列映射引用了不存在的单元格")
-            if coordinate_to_tuple(address)[0] != item.header_row or cells[address].get("formula"):
-                raise ValueError("Skill列映射不是实际表头单元格")
+                invalid(f"columns.{field}", "missing_source_cell")
+            elif coordinate_to_tuple(address)[0] != item.header_row or cells[address].get("formula"):
+                invalid(f"columns.{field}", "not_header_cell")
+    if errors:
+        raise PlanValidationError(errors)
     return plan
+
+
+def normalize_plan(plan):
+    """Normalize notation only; never invent a cell or move a data cell to a header."""
+    for item in plan.sheets:
+        for field, address in item.columns.items():
+            address = address.strip().upper()
+            match = re.fullmatch(r"\$?([A-Z]{1,2})(?:\$?([1-9][0-9]{0,3}))?", address)
+            if match and (match[2] or item.header_row):
+                item.columns[field] = match[1] + (match[2] or str(item.header_row))
+    return plan
+
+
+def recover_plan(plan, pages, skills):
+    """Discard untrusted mappings, not source facts or the validated sheet purpose."""
+    recovered = plan.model_copy(deep=True)
+    try:
+        validate_plan(recovered, pages, skills)
+    except PlanValidationError as exc:
+        affected = {int(error["path"].split(".")[1]) for error in exc.fields}
+        for index in affected:
+            item = recovered.sheets[index]
+            item.skill = "excel-freeform"
+            item.layout = "mixed"
+            item.header_row = None
+            item.columns = {}
+            item.reason = "列映射未通过来源校验，改用逐单元格解析；禁止按猜测列补齐项目或数量。"
+        validate_plan(recovered, pages, skills)
+    return recovered
 
 
 def structural_profile(plan, pages):

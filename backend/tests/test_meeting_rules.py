@@ -208,12 +208,14 @@ def test_catalog_letter_measure_cannot_skip_character_count(client, price_input,
     price = client.post("/api/prices", json={
         **price_input, "status": "active", "unit": "cm", "amount": "19"}).json()
     line = requirement(pricing_family="letter", billing_length_mm=220, character_count=4,
+        material=price["material"], thickness_mm=price["thickness_mm"],
         estimate={"scope": "字类成品引用，图纸单字22厘米四字一组", "costs": [
             cost("finished", 19, "=billing_length_mm/10", source="catalog",
                  reference_id=price["id"], reference_revision=price["revision"])]})
     assert priced(test_db, line)["total"] is None
     line.estimate.costs[0].quantity_formula = "=letter_cm"
-    assert priced(test_db, line)["total"] == "3344.00"
+    result = priced(test_db, line)
+    assert result["total"] == "3344.00", result["lines"][0]["blockers"]
 
 
 def test_explicit_area_is_available_but_letter_area_never_omits_count(test_db):

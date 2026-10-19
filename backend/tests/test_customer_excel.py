@@ -12,6 +12,7 @@ from PIL import Image
 
 from app.customer_excel import MEDIA_TYPE, page_source, validate_excel_rows, image_batches, merge_drawing_results
 from app.customer_files import FileRejected, cleanup_file, prepare_file, storage_path
+from app.excel_manifest import ensure_preview
 from app.requirements_schemas import ExtractionResult, ExtractedLine, Evidence
 from app.config import settings
 from app import deepseek
@@ -160,6 +161,7 @@ def test_unstructured_difficulty_note_is_preserved_without_guessing():
 
 
 def test_model_excel_input_drawings_and_omission_fallback(monkeypatch):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     file = SimpleNamespace(id=41, **prepare_file(workbook_bytes(), "customer.xlsx"))
     seen = []
 
@@ -168,7 +170,7 @@ def test_model_excel_input_drawings_and_omission_fallback(monkeypatch):
         page = len(seen) + 1
         seen.append(parts)
         assert any("原始文本/单元格" in part.get("text", "") for part in parts)
-        assert len([part for part in parts if part["type"] == "image_url"]) == (2 if page == 1 else 1)
+        assert len([part for part in parts if part["type"] == "image_url"]) == (1 if page == 1 else 0)
         result = {"lines": [{"source_item": "1", "product": "项目1" if page == 1 else "立牌",
             "difficulty": "A", "evidence": [{"file_id": 41, "page": page,
                 "sheet": "客户明细" if page == 1 else "造型", "cell": "B2", "text": "项目"}]}]}
@@ -190,7 +192,8 @@ def test_drawing_count_is_not_limited_and_all_originals_are_retained(count):
     assert len(source["images"]) == count
     assert len({image["storage"] for image in source["images"]}) == count
     assert all((directory / image["storage"]).is_file() for image in source["images"])
-    with Image.open(directory / "page-1.png") as preview:
+    assert not (directory / "page-1.png").exists()
+    with Image.open(ensure_preview(directory, 1)) as preview:
         assert preview.width * preview.height < 25_000_000
     batches = list(image_batches(directory, 1))
     assert batches[0][0] == 0 and batches[-1][1] == count
@@ -245,6 +248,7 @@ def test_more_than_twenty_excel_pages_can_upload_append_extract_and_keep_provena
 
 
 def test_all_drawing_batches_are_read_without_duplicate_projects_or_lost_conflicts(monkeypatch):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     file = SimpleNamespace(id=41, **prepare_file(workbook_bytes(image_count=13), "many.xlsx"))
     seen, image_names = [], []
 
@@ -266,7 +270,7 @@ def test_all_drawing_batches_are_read_without_duplicate_projects_or_lost_conflic
             "message": {"content": json.dumps({"lines": [line]})}}], "usage": {"total_tokens": 10}})
     configure_transport(monkeypatch, handler)
     result, attempts, usage = deepseek.extract([file], "", [], "")
-    assert seen == [(1, 6), (1, 6), (1, 1), (2, 1)]
+    assert seen == [(1, 6), (1, 6), (1, 1), (2, 0)]
     assert image_names == [f"excel-image-{index}.png" for index in range(1, 14)]
     assert attempts == 5 and usage["total_tokens"] == 40
     assert len(result.lines) == 4
@@ -285,6 +289,7 @@ def test_conflicting_batch_quantities_stay_unknown_even_when_later_views_repeat(
 
 
 def test_failed_drawing_batch_keeps_paid_usage_and_stops_later_batches(monkeypatch):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     file = SimpleNamespace(id=41, **prepare_file(workbook_bytes(image_count=13), "many.xlsx"))
     calls = []
 

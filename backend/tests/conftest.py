@@ -17,6 +17,12 @@ def isolate_customer_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(settings(), "deepseek_api_key", "")
     monkeypatch.setattr(settings(), "siliconflow_api_key", "")
     monkeypatch.setattr(settings(), "agent_background", False)
+    # Existing scripted providers intentionally assert sequential call order.
+    # Concurrency tests opt in and route their replies by active item.
+    monkeypatch.setattr(settings(), "agent_pricing_concurrency", 1)
+    # Legacy fixtures exercise extraction only; visual audit tests enable the extra provider stage.
+    monkeypatch.setattr(settings(), "visual_region_audit", False)
+    monkeypatch.setattr(settings(), "source_agent_enabled", False)
 
 
 @pytest.fixture

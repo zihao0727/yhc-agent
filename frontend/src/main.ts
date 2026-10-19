@@ -6,5 +6,6 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 import App from './App.vue'
 import './style.css'
 import './requirements.css'
+import './quote-workspace.css'
 
 createApp(App).use(ElementPlus, { locale: zhCn }).mount('#app')

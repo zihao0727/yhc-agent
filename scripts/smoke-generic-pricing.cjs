@@ -21,7 +21,7 @@ async function main() {
   const cost = {
     label: '面板制作', rate: '100', rate_unit: 'm2', expected_amount: '20',
     quantity_formula: '=billable_area_m2', basis: 'per_piece', kind: 'material',
-    source: 'agent_estimate', reference_id: null, reference_revision: null,
+    source: 'catalog', reference_id: 1, reference_revision: 1, reference_part: 'material_price',
     reason: '按面板实际面积暂估，单价待管理员核实', measurement_note: '',
     target: 'component', target_index: 0, included_kinds: ['process'], adjusts_cost_index: null,
     rate_basis_amount: null, rate_basis_unit: null, outsourcing_type: 'other', minimum_area_scope: 'unconfirmed',
@@ -63,7 +63,8 @@ async function main() {
     fixed_charges: '0', price: null, blockers: [], warnings: ['暂估价格须人工审核'],
     resolution: 'priced_review', estimate_review: [], estimate_scope: assembled.estimate.scope,
     pricing_strategy: { key: 'composite', label: '部件组合', version: 'measurement.v2' },
-    estimate_costs: [{ ...cost, amount: '20.00', measure: '.2', resolved_formula: '100 × 0.2 = 20', reference: null }],
+    estimate_costs: [{ ...cost, amount: '20.00', measure: '.2', resolved_formula: '100 × 0.2 = 20',
+      reference: { part: 'material_price', source_cell: 'H12' } }],
     review_signals: [{ code: 'unverified_rate', cost_index: 0, message: '单价尚未确认，须管理员核价' }],
   }
   const quote = {
@@ -109,6 +110,7 @@ async function main() {
       } else {
         assert.equal(request.method(), 'GET', 'All mutations must remain mocked')
         if (pathname === '/api/session') body = { authenticated: true }
+        else if (pathname === '/api/upload-config') body = {}
         else if (pathname === '/api/stats') body = { prices: 0, draft: 0, active: 0, inactive: 0, products: 0, rules: 0, documents: 0 }
         else if (pathname === '/api/options') body = { categories: [], products: [] }
         else if (pathname.endsWith('model-config') || pathname.endsWith('embedding-config')) body = { configured: true, model: 'mock-only', environment_managed: false }
@@ -126,6 +128,8 @@ async function main() {
     assert.match(await counts.textContent(), /待管理员核价 1 项/)
     assert.match(await counts.textContent(), /系统执行异常 1 项/)
     await page.screenshot({ path: path.join(output, 'generic-pricing-status-desktop.png'), animations: 'disabled' })
+    await page.locator('.chat-pricing-details > summary').first().click()
+    assert.match(await page.locator('.pricing-details').first().innerText(), /H12/)
     await page.getByRole('button', { name: '明细与报价', exact: true }).click()
     await page.getByRole('tab', { name: '需求明细 (4)' }).click()
     await page.locator('.product-link').filter({ hasText: '组合标牌' }).click()
@@ -159,6 +163,7 @@ async function main() {
     await dialog.locator('.el-form-item').filter({ hasText: '补全依据' }).getByRole('textbox').fill('按该部件单元格原文纠正识别高度，待审核')
     await select('费用1对象', '部件 2 · 边框')
     await select('费用1对象', '部件 1 · 面板')
+    await select('费用1引用范围', '原表材料成本')
     await dialog.getByRole('button', { name: '删除部件1', exact: true }).click()
     await page.getByText('该对象仍被费用或补全参数引用，请先调整引用', { exact: true }).waitFor()
     assert.equal(await dialog.getByRole('textbox', { name: '部件1名称', exact: true }).inputValue(), '面板')
@@ -195,6 +200,7 @@ async function main() {
     assert.equal(plan.assumptions[0].evidence[0].cell, 'C2')
     assert.deepEqual(plan.costs[0].included_kinds, ['process'])
     assert.equal(plan.costs[0].target_index, 0)
+    assert.equal(plan.costs[0].reference_part, 'material_price')
     assert.equal(writes[0].lines[0].source_measurements[0].value, '1.5')
     assert.equal(writes[0].lines[0].quantity_evidence[0].raw_quantity, '1.5米')
     assert.deepEqual(errors, [])

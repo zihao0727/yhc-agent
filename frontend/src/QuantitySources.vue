@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import type { Line } from './requirements-types'
 defineProps<{ line: Line }>()
+const units: Record<string, string> = { m: '米', m2: '平方米', m3: '立方米', kg: '千克', hour: '小时' }
 </script>
 
 <template>
   <section v-if="line.source_measurements?.length || line.quantity_evidence?.some(e => e.validation_status === 'rejected')" class="quantity-sources">
     <div v-for="(measurement, index) in line.source_measurements || []" :key="index" class="source-measurement">
-      <strong>原始工程量：{{ measurement.value }} {{ measurement.unit === 'm' ? '米' : '平方米' }}</strong>
+      <strong>原始工程量：{{ measurement.value }} {{ units[measurement.unit] }}</strong>
       <span>{{ measurement.evidence.map(e => `${e.sheet || `文件${e.file_id}`} ${e.cell || `第${e.page}页`}`).join(' · ') }}</span>
     </div>
     <details v-if="line.quantity_evidence?.some(e => e.validation_status === 'rejected')">

@@ -2,10 +2,25 @@ from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from .process_taxonomy import ProcessCode
 
 Status = Literal["draft", "active", "inactive"]
-Unit = Literal["cm", "m", "m2", "piece", "set", "fixed", "hour", "unknown"]
+Unit = Literal["cm", "m", "m2", "m3", "kg", "piece", "set", "fixed", "hour", "unknown"]
 PriceKind = Literal["standard", "suggested", "starting", "reference"]
+
+class CatalogContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    cost_group: Literal["finished", "material_process", "assembly_reference"]
+    pricing_scope: str = Field(min_length=2, max_length=1500)
+    process_codes: list[ProcessCode] = Field(default_factory=list, max_length=20)
+    included_process_codes: list[ProcessCode] = Field(default_factory=list, max_length=20)
+
+    @field_validator("process_codes", "included_process_codes")
+    @classmethod
+    def distinct_codes(cls, value):
+        if len(set(value)) != len(value):
+            raise ValueError("工艺范围不能重复")
+        return value
 
 
 class PriceInput(BaseModel):
@@ -27,6 +42,7 @@ class PriceInput(BaseModel):
     revision: int | None = Field(default=None, ge=1)
     included_cost_kinds: list[Literal["material", "process", "power", "bracket", "outsourcing"]] | None = Field(
         default=None, max_length=5)
+    catalog_contract: CatalogContract | None = None
 
     @field_validator("included_cost_kinds")
     @classmethod

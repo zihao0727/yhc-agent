@@ -14,15 +14,17 @@ def candidate_prices(db, line, query=""):
     term = (query or line.pricing_category or line.product).strip()
     if not term:
         return []
-    stmt = select(PriceItem, Product.name).join(Product).where(
-        PriceItem.status != "inactive",
-        or_(Product.name.contains(term, autoescape=True), PriceItem.material.contains(term, autoescape=True)),
-    ).order_by(PriceItem.id).limit(200)
-    rows = db.execute(stmt).all()
+    from .catalog_search import search_catalog, catalog_profile, select_candidate_hits
+    result = search_catalog(db, term, status="all",
+                            raw=line.model_dump(mode="json")
+                            if term in (line.product, line.pricing_category) else None)
+    rows = [(hit.price, hit.name) for hit in select_candidate_hits(result)]
     preload_sources(db, [price for price, _ in rows])
     candidates = []
     for price, product_name in rows:
         mismatches = []
+        if "material_price" in (price.attributes or {}):
+            mismatches.append("材料及工艺分项依据，需组合计价，不能直接作为整件报价")
         if line.material and price.material and line.material != price.material:
             mismatches.append("材质不同")
         if line.thickness_mm and price.thickness_mm and line.thickness_mm != price.thickness_mm:
@@ -30,10 +32,10 @@ def candidate_prices(db, line, query=""):
         if line.language != "unknown" and price.language not in ("all", line.language):
             mismatches.append("文字类型不同")
         value = snapshot(price)
-        value.update(product=product_name, mismatches=mismatches, source=price_source(db, price))
+        value.update(product=product_name, mismatches=mismatches, source=price_source(db, price),
+                     catalog_profile=catalog_profile(price))
         candidates.append(value)
-    candidates.sort(key=lambda x: (len(x["mismatches"]), x["status"] != "active", x["id"]))
-    return candidates[:40]
+    return candidates
 
 
 def preload_sources(db, prices):
@@ -193,6 +195,9 @@ def calculate_line(db, line: RequirementLine, automatic=False, details=True):
         blockers.append("价格版本已变化，需重新选择并确认")
     if price.price_kind not in ("standard", "suggested"):
         blockers.append("起价或参考价不能用于标准计算")
+    from .catalog_search import catalog_profile
+    if catalog_profile(price)["cost_group"] != "finished":
+        blockers.append("材料工艺分项或配置参考不能直接作为整件报价，请使用对象级费用方案核价")
     if price.amount is None or price.unit == "unknown":
         blockers.append("单价或计价单位未确认")
     if business_rules.current(line) and price.unit not in ("cm", "m2"):
@@ -212,6 +217,11 @@ def calculate_line(db, line: RequirementLine, automatic=False, details=True):
         else:
             measure = line.billing_length_mm / (10 if price.unit == "cm" else 1000)
     elif price.unit == "m2":
+        from .quote_safety import validate_area_basis
+        try:
+            validate_area_basis(line)
+        except ValueError as exc:
+            blockers.append(str(exc))
         if not line.width_mm or not line.height_mm:
             blockers.append("缺少单件计价宽、高（mm）")
         else:
@@ -253,11 +263,25 @@ def calculate_line(db, line: RequirementLine, automatic=False, details=True):
     return result
 
 
-def build_quote(db, requirements, automatic=False, rounding="none"):
+def calculate_requirements(db, requirements, automatic=False):
+    from .quote_safety import inventory_blockers
+    issues = inventory_blockers(requirements)
+    results = []
+    for raw in requirements:
+        line = calculate_line(db, RequirementLine.model_validate(raw), automatic)
+        if issues.get(raw["id"]):
+            line["blockers"].extend(issues[raw["id"]])
+            line["amount"] = line["unit_price"] = None
+            from .pricing_diagnostics import diagnostics_for
+            line["diagnostics"] = diagnostics_for(RequirementLine.model_validate(raw), line["blockers"])
+        results.append(line)
+    return results
+
+
+def annotate_lines(db, lines, automatic=False, include_component_analysis=True):
     from .component_pricing import analyze_components
     from .pricing_diagnostics import diagnostics_for, line_resolution
     from .pricing_strategies import strategy_snapshot
-    lines = [calculate_line(db, RequirementLine.model_validate(line), automatic) for line in requirements]
     for line in lines:
         if automatic and unit_price_usable(line) and not line.get("manual_price") and not line.get("estimated"):
             requirement = RequirementLine.model_validate(line["requirement"])
@@ -265,11 +289,12 @@ def build_quote(db, requirements, automatic=False, rounding="none"):
             if len(usable_price_ids(db, requirement, price.product_id)) > 1:
                 line["blockers"].append("存在多个适用价格，需要人工确认")
                 line["amount"] = line["unit_price"] = None
-        line["component_analysis"] = analyze_components(db, RequirementLine.model_validate(line["requirement"]))
+        if include_component_analysis:
+            line["component_analysis"] = analyze_components(db, RequirementLine.model_validate(line["requirement"]))
         line["estimate_conditions"] = list(line["warnings"])
         if line.get("estimated"):
             line["estimate_conditions"].append(line["estimate_scope"])
-        if line["unit_price"] is not None:
+        if line["unit_price"] is not None and not line.get("billing_unit"):
             line["estimate_conditions"].append("成品单价包含每件附加费；整单附加费另列，不分摊至单价。")
             if line["requirement"]["quantity"] is None and not line.get("estimated"):
                 line["estimate_conditions"].append("数量未确认，仅报成品单价，未计入成品小计。")
@@ -283,6 +308,12 @@ def build_quote(db, requirements, automatic=False, rounding="none"):
         line["resolution"] = line_resolution(line)
     from .quote_review import review_signals
     review_signals(lines)
+    return lines
+
+
+def build_quote(db, requirements, automatic=False, rounding="none", extraction=None):
+    from .pricing_diagnostics import RESOLUTIONS
+    lines = annotate_lines(db, calculate_requirements(db, requirements, automatic), automatic)
     subtotal = sum((Decimal(line["amount"]) for line in lines if line["amount"] is not None), Decimal(0))
     complete = bool(lines) and all(not line["blockers"] for line in lines)
     review_items = []
@@ -305,31 +336,52 @@ def build_quote(db, requirements, automatic=False, rounding="none"):
             "review_items": review_items, "has_estimates": any(line.get("estimated") for line in lines),
             "requires_review": bool(review_items) or any(line["warnings"] or line["review_signals"] for line in lines),
             "resolution_counts": {status: sum(line["resolution"] == status for line in lines)
-                                  for status in ("priced", "priced_review", "unresolved", "customer_confirmation",
-                                                 "administrator_pricing", "execution_error")},
+                                  for status in RESOLUTIONS},
             "measurement_contract": "measurement.v2"}
+    from .pricing_contract import ENGINE_VERSION
+    payload["pricing_engine_version"] = ENGINE_VERSION
     if any(line["business_rules_version"] == business_rules.VERSION for line in lines):
         payload["business_rules"] = business_rules.snapshot()
+    if extraction:
+        from .source_reconciliation import source_review
+        payload["source_review"] = source_review(extraction)
+        if extraction.get("questions"):
+            payload["review_questions"] = extraction["questions"]
+            payload["requires_review"] = True
+        if payload["source_review"]["required"]:
+            payload["requires_review"] = True
+            payload["review_questions"] = list(dict.fromkeys([
+                *extraction.get("questions", []),
+                "资料仍有未读清区域或跨文件归属冲突，须逐项核图并确认订购范围，防止漏项或重复计费。"]))
+        if (extraction.get("incomplete") or payload["source_review"].get("unread_pages")
+                or payload["source_review"].get("inventory_issues")):
+            payload.update(complete=False, total=None)
     return business_rules.round_quote(payload, rounding)
 
 
 def confirmation_items(lines):
+    from .pricing_diagnostics import OWNERS
     grouped = {}
+    reasons = {}
     for line in lines:
         issue = line.get("deferred_issue") if line["amount"] is None else None
         if issue:
-            owner = "需求方" if issue["cause"] == "customer_input" else "报价管理员"
+            owner = OWNERS.get(issue["cause"], "报价管理员")
             key = (owner, issue.get("question") or issue["reason"], issue["cause"])
             grouped.setdefault(key, []).append({"line_id": line["line_id"], "product": line["product"]})
+            if issue.get("reason"):
+                reasons.setdefault(key, []).append(issue["reason"])
             continue
         for blocker in line["blockers"]:
             diagnosis = next((d for d in line.get("diagnostics", []) if d["message"] == blocker), None)
             cause = diagnosis["cause"] if diagnosis else None
-            owner = "报价管理员" if cause in ("execution_error", "catalog_gap") or any(
-                word in blocker for word in ("价格", "单价", "规则", "人工", "计价单位")) else "需求方"
+            owner = OWNERS.get(cause) or ("报价管理员" if any(
+                word in blocker for word in ("价格", "单价", "规则", "人工", "计价单位")) else "需求方")
             key = (owner, blocker, cause)
             grouped.setdefault(key, []).append({"line_id": line["line_id"], "product": line["product"]})
     return [{"owner": owner, "question": question, "lines": affected,
+             **({"reason": "；".join(dict.fromkeys(reasons[owner, question, cause]))}
+                if (owner, question, cause) in reasons else {}),
              **({"cause": cause} if cause else {})}
             for (owner, question, cause), affected in grouped.items()]
 
@@ -341,7 +393,7 @@ def quote_stale(db, quote, job):
         if line.get("estimated"):
             requirement = RequirementLine.model_validate(line["requirement"])
             current = calculate_line(db, requirement, automatic=True)
-            if current["blockers"] or current["amount"] != line["amount"]:
+            if (line["amount"] is not None and current["blockers"]) or current["amount"] != line["amount"]:
                 return True
             # Validate recorded standard-price and rule dependencies as well as estimate cost references.
             if current.get("price") != line.get("price") or current.get("rule_revisions") != line.get("rule_revisions"):

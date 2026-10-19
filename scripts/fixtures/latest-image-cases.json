@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "job_id": 24,
+      "source_sha256": "f6afbb29bd9e5c5376ddb716a323a9d74bc403fe27b5420b16e43f5a9a827a71"
+    },
+    {
+      "job_id": 25,
+      "source_sha256": "f6afbb29bd9e5c5376ddb716a323a9d74bc403fe27b5420b16e43f5a9a827a71"
+    }
+  ],
+  "materials": [
+    { "material": "不锈钢", "thickness_mm": 1.5 },
+    { "material": "不锈钢", "thickness_mm": 1.2 },
+    { "material": "铝", "thickness_mm": 3 },
+    { "material": "亚克力", "thickness_mm": 5 }
+  ]
+}

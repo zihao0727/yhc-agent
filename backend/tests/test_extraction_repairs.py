@@ -46,7 +46,7 @@ def test_missing_sheet_absolute_address_and_unique_image_anchor_are_resolved():
 
 
 @pytest.mark.parametrize("sheet,cell", [("编造表名", "B3"), ("", "B999"), ("", "另一张表!B3"),
-                                       ("", "B3:F3")])
+                                       ("", "B3:F4")])
 def test_explicit_wrong_provenance_is_never_overwritten(sheet, cell):
     source = source_fixture()
     line = ExtractedLine.model_validate({"evidence": [
@@ -251,6 +251,7 @@ def test_unknown_dimension_does_not_relax_other_schema_or_excel_source_checks(mo
 
 
 def test_failed_later_batch_reuses_successful_batch_without_repaying(monkeypatch):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     file = SimpleNamespace(id=41, **prepare_file(workbook_bytes(image_count=13), "many.xlsx"))
     saved, seen = [], []
 
@@ -273,7 +274,8 @@ def test_failed_later_batch_reuses_successful_batch_without_repaying(monkeypatch
     with pytest.raises(deepseek.ModelFailure) as failure:
         deepseek.extract([file], "", [], "", _checkpoint=checkpoint)
     assert failure.value.diagnostics["retryable"] is True
-    assert len(saved) == 2 and saved[-1][1]["total_tokens"] == 10
+    assert len(saved[-1][0]["batches"]) == 1
+    assert sum(usage.get("total_tokens", 0) for _, usage in saved) == 10
     restored = ExtractionCheckpoint("same-input", saved[-1][0], persist, lambda: None)
     result, attempts, usage = deepseek.extract([file], "", [], "", _checkpoint=restored)
     assert len(result.lines) == 4 and attempts == 3 and usage["total_tokens"] == 30
@@ -307,8 +309,9 @@ def enqueue_excel(client, monkeypatch):
     return response.json()
 
 
-def test_worker_schema_failure_waits_instead_of_scheduling_more_paid_calls(
+def test_worker_schema_failure_tries_bounded_recovery_before_waiting(
         client, monkeypatch, redis_worker):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     job = enqueue_excel(client, monkeypatch)
     calls = []
 
@@ -322,14 +325,17 @@ def test_worker_schema_failure_waits_instead_of_scheduling_more_paid_calls(
     agent_worker.run_pending_once(threading.Event())
     current = client.get(f'/api/jobs/{job["id"]}').json()
     run = current["agent_runs"][0]
-    assert len(calls) == 2 and run["status"] == "waiting"
+    assert len(calls) == 4 and run["status"] == "waiting"
     assert run["usage"]["retry_at"] == 0 and "retry_count" not in run["usage"]
-    assert "字段" in run["message"] and "存储" not in run["message"]
+    assert "自动核对" in run["message"] and "存储" not in run["message"]
+    assert run["usage"]["total_tokens"] == 40
+    assert any(step["tool"] == "extraction_recovery_started" for step in run["steps"])
     assert current["requirements"] == [] and current["quotes"] == []
 
 
 def test_worker_checkpoints_resume_and_accumulate_all_paid_usage(
         client, monkeypatch, redis_worker, test_db):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     from app.models import AgentRun
     job = enqueue_excel(client, monkeypatch)
     calls = []
@@ -364,11 +370,14 @@ def test_worker_checkpoints_resume_and_accumulate_all_paid_usage(
     assert "extraction_checkpoint" not in client.get(
         f'/api/jobs/{job["id"]}/progress').json()["run"]["usage"]
     with test_db() as db:
-        assert len(db.get(AgentRun, run["id"]).usage["extraction_checkpoint"]["batches"]) == 4
+        batches = db.get(AgentRun, run["id"]).usage["extraction_checkpoint"]["batches"]
+        assert len(batches) == 5  # Three image batches, their merged page, and the text-only sheet.
+        assert json.dumps([[[job["files"][0]["id"], 1]], None], separators=(",", ":")) in batches
 
 
 def test_stop_during_extraction_prevents_subsequent_batches_and_overwrite(
         client, monkeypatch, redis_worker):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
     job = enqueue_excel(client, monkeypatch)
     calls = []
 
@@ -389,31 +398,45 @@ def test_stop_during_extraction_prevents_subsequent_batches_and_overwrite(
 
 def test_manual_retry_reuses_prior_run_batches_for_identical_inputs(
         client, monkeypatch, redis_worker):
+    monkeypatch.setattr(settings(), "excel_native_first", False)
+    monkeypatch.setattr(settings(), "extraction_recovery_rounds", 2)
     job = enqueue_excel(client, monkeypatch)
     calls = []
 
     def handler(request):
+        from test_agent_loop import call
+        payload = json.loads(request.content)
         calls.append(1)
+        if payload.get("tools") and len(calls) > 5:
+            line = {"product": "项目1", "source_item": "1", "evidence": [
+                {"file_id": job["files"][0]["id"], "page": 1,
+                 "sheet": "客户明细", "cell": "B2", "text": "项目1"}]}
+            return httpx.Response(200, json={"choices": [{"finish_reason": "tool_calls",
+                "message": call("repair_extraction_line", line_index=0, line=line)}],
+                "usage": {"total_tokens": 10}})
         content = '{"lines":[{"price":99}]}' if len(calls) in (2, 3) else '{"lines":[]}'
         return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
             "message": {"content": content}}], "usage": {"total_tokens": 10}})
 
-    def denied(*args):
+    original_turn = deepseek.agent_turn
+    def denied(messages, tools):
+        if tools[0]["function"]["name"] == "read_extraction_source":
+            return original_turn(messages, tools)
         raise deepseek.ModelFailure("计价连接测试中止", diagnostics={"retryable": False})
 
     configure_transport(monkeypatch, handler)
     monkeypatch.setattr(deepseek, "agent_turn", denied)
     agent_worker.run_pending_once(threading.Event())
     current = client.get(f'/api/jobs/{job["id"]}').json()
-    assert current["agent_runs"][0]["status"] == "waiting" and len(calls) == 3
+    assert current["agent_runs"][0]["status"] == "waiting" and len(calls) == 5
     response = client.post(f'/api/jobs/{job["id"]}/agent', json={
         "revision": current["revision"], "intent": "extract", "allow_external_processing": True})
     assert response.status_code == 200
     agent_worker.run_pending_once(threading.Event())
     current = client.get(f'/api/jobs/{job["id"]}').json()
-    assert len(calls) == 6 and len(current["requirements"]) == 4
+    assert len(calls) == 8 and len(current["requirements"]) == 4
     assert current["agent_runs"][0]["usage"]["total_tokens"] == 30
-    assert current["agent_runs"][1]["usage"]["total_tokens"] == 30
+    assert current["agent_runs"][1]["usage"]["total_tokens"] == 50
 
 
 def test_no_progress_context_encourages_saved_estimate_without_forcing_a_rate(

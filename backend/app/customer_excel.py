@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, coordinate_to_tuple
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from .measurement_units import COUNT_ALIASES, ENGINEERING_FACTORS
 
 MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ROWS_PER_PAGE = 20
@@ -22,6 +23,7 @@ MAX_CELLS = 50000
 MAX_EXPANDED = 100 * 1024 * 1024
 PREVIEW_IMAGES = 6
 IMAGES_PER_BATCH = 6
+ROWS_PER_BATCH = 5
 IMAGE_BATCH_BYTES = 12 * 1024 * 1024
 NS = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -36,7 +38,7 @@ def xml(archive, name):
     return ET.fromstring(data)
 
 
-def relationships(archive, part):
+def relationships(archive, part, *, allow_missing=False):
     folder, name = posixpath.split(part)
     relpart = posixpath.join(folder, "_rels", name + ".rels")
     if relpart not in archive.namelist():
@@ -48,7 +50,11 @@ def relationships(archive, part):
         target = rel.get("Target", "")
         resolved = posixpath.normpath(target.lstrip("/") if target.startswith("/")
                                      else posixpath.join(folder, target))
-        if resolved.startswith("../") or resolved not in archive.namelist():
+        if resolved.startswith("../"):
+            raise ValueError("Excel资源引用无效")
+        if resolved not in archive.namelist():
+            if allow_missing:
+                continue
             raise ValueError("Excel资源引用无效")
         result[rel.get("Id")] = resolved
     return result
@@ -62,7 +68,7 @@ def font(size=16):
     return ImageFont.load_default()
 
 
-def render(page, directory):
+def render(page, directory, target=None):
     # Text preview and drawings share source-row labels; original images stay separate.
     thumbnails = page["images"][:PREVIEW_IMAGES]
     canvas = Image.new("RGB", (1600, 190 + len(page["rows"]) * 72 + len(thumbnails) * 360), "white")
@@ -89,12 +95,12 @@ def render(page, directory):
             canvas.paste(thumb, (30, y + 40))
             thumb.close()
         y += 360
-    canvas.save(directory / f'page-{page["page"]}.png', optimize=True)
+    canvas.save(target or directory / f'page-{page["page"]}.png', format="PNG", optimize=True)
     canvas.close()
 
 
 def prepare_excel(data, directory):
-    pages, sources, image_count, cell_count = [], [], 0, 0
+    pages, sources, image_count, cell_count, resource_audit = [], [], 0, 0, []
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         members = archive.infolist()
         names = [member.filename for member in members]
@@ -138,6 +144,13 @@ def prepare_excel(data, directory):
                 last_row = max(last_row, row)
             notes = []
             drawings = []
+            from .excel_assets import resolve_cell_images
+            embedded, audit = resolve_cell_images(archive, cells, directory, image_count)
+            drawings.extend(embedded)
+            image_count += len(embedded)
+            resource_audit.extend({**item, "sheet": sheet.get("name", "")} for item in audit)
+            notes.extend(f'图片{item["cell"]}未读取：{item["reason"]}，涉及的文字及尺寸须核实'
+                         for item in audit if item["status"] != "resolved")
             sheet_rels = relationships(archive, part)
             for drawing in tree.findall("s:drawing", NS):
                 drawing_part = sheet_rels.get(drawing.get(f'{{{NS["r"]}}}id'))
@@ -148,6 +161,9 @@ def prepare_excel(data, directory):
                     origin = anchor.find("d:from", NS)
                     if origin is None:
                         notes.append("存在未绑定单元格的图形，请人工核对所属项目")
+                        resource_audit.append({"sheet": sheet.get("name", ""), "cell": "",
+                                               "kind": "drawing", "status": "unresolved",
+                                               "reason": "unanchored_drawing"})
                         continue
                     row = int(origin.findtext("d:row", "0", NS)) + 1
                     col = int(origin.findtext("d:col", "0", NS)) + 1
@@ -156,10 +172,16 @@ def prepare_excel(data, directory):
                     blip = anchor.find(".//a:blip", NS)
                     if blip is None:
                         notes.append(f"第{row}行含不支持的形状/图表，请另附图片核对")
+                        resource_audit.append({"sheet": sheet.get("name", ""), "row": row,
+                            "cell": f"{get_column_letter(col)}{row}", "kind": "drawing",
+                            "status": "unresolved", "reason": "unsupported_shape"})
                         continue
                     target = drawing_rels.get(blip.get(f'{{{NS["r"]}}}embed'))
                     if not target:
                         notes.append(f"第{row}行图纸为外部链接，未下载，请另附图片")
+                        resource_audit.append({"sheet": sheet.get("name", ""), "row": row,
+                            "cell": f"{get_column_letter(col)}{row}", "kind": "drawing",
+                            "status": "unresolved", "reason": "external_reference"})
                         continue
                     image_count += 1
                     raw = archive.read(target)
@@ -175,6 +197,9 @@ def prepare_excel(data, directory):
                             original.save(directory / key, optimize=True)
                             original.close()
                     drawings.append({"row": row, "cell": f"{get_column_letter(col)}{row}", "storage": key})
+                    resource_audit.append({"sheet": sheet.get("name", ""), "row": row,
+                        "cell": f"{get_column_letter(col)}{row}", "kind": "drawing",
+                        "status": "resolved", "storage": key})
                     last_row = max(last_row, row)
             if last_row:
                 specs.append((sheet.get("name", "")[:100], tree, drawings, notes, last_row))
@@ -213,14 +238,18 @@ def prepare_excel(data, directory):
                             "row_end": chunk[-1], "rows": [
                                 {"row": row, "cells": indexed.get(row, [])} for row in chunk],
                             "images": page_drawings, "warnings": notes,
+                            "resource_audit": [item for item in resource_audit if item["sheet"] == name
+                                               and (not item.get("row") or item["row"] in chunk)],
                             "header_rows": [{"row": row, "cells": indexed.get(row, [])} for row in active[:3]],
                             "merged_cells": [merge.get("ref") for merge in tree.findall("s:mergeCells/s:mergeCell", NS)]}
                     pages.append(page)
-                    render(page, directory)
                 sources.append(name)
         finally:
             workbook.close()
-    manifest = {"format": "xlsx", "sheets": sources, "pages": pages,
+    manifest = {"format": "xlsx", "parser_version": 2, "sheets": sources, "pages": pages,
+                "resource_summary": {"discovered": len(resource_audit),
+                    "resolved": sum(item["status"] == "resolved" for item in resource_audit),
+                    "unresolved": sum(item["status"] != "resolved" for item in resource_audit)},
                 "notice": "公式仅保留原文和未验证缓存值，不执行宏、公式或外部链接；图纸按锚点行关联，跨行图纸归属须复核。"}
     encoded = json.dumps(manifest, ensure_ascii=False)
     if len(encoded) > 600000:
@@ -234,9 +263,52 @@ def source_cells(source):
             for cell in row["cells"]} | {image["cell"] for image in source["images"]}
 
 
+def same_row_range(address, source):
+    match = re.fullmatch(r"([A-Z]{1,2}[1-9][0-9]{0,3})\s*[:-]\s*([A-Z]{1,2}[1-9][0-9]{0,3})", address)
+    if not match:
+        return None
+    start, end = coordinate_to_tuple(match[1]), coordinate_to_tuple(match[2])
+    cells = source_cells(source)
+    if (start[0] != end[0] or start[1] > end[1] or end[1] > MAX_COLS
+            or match[1] not in cells or match[2] not in cells):
+        return None
+    return f"{match[1]}:{match[2]}", [
+        cell for cell in sorted(cells, key=coordinate_to_tuple)
+        if coordinate_to_tuple(cell)[0] == start[0]
+        and start[1] <= coordinate_to_tuple(cell)[1] <= end[1]]
+
+
 def validate_evidence(evidence, source):
     if evidence.sheet != source["sheet"] or evidence.cell not in source_cells(source):
         raise ValueError("Excel来源工作表或单元格无效")
+    if evidence.source_range:
+        selected = same_row_range(evidence.source_range, source)
+        if selected is None or evidence.cell not in selected[1]:
+            raise ValueError("Excel来源范围不存在、跨项目行或不包含引用的单元格")
+
+
+def project_source_row(line, source):
+    columns, header = table_columns(source)
+    if not line.source_item or not line.product or not {"item", "product"} <= columns.keys():
+        return None
+    matches = []
+    for row in source["rows"]:
+        if row["row"] <= header:
+            continue
+        cells = {coordinate_to_tuple(cell["cell"])[1]: cell for cell in row["cells"]}
+        item, product = cells.get(columns["item"]), cells.get(columns["product"])
+        if (item and product and not item.get("formula") and not product.get("formula")
+                and item["value"].strip() == line.source_item and product["value"].strip() == line.product):
+            matches.append(row)
+    return matches[0] if len(matches) == 1 else None
+
+
+def expand_source_evidence(evidence, source, addresses, original_range=""):
+    """Use original cell text, not the model's unverified combined quotation."""
+    return [evidence.model_copy(update={"cell": cell["cell"], "text": cell["value"][:1500],
+                                      "source_range": original_range})
+            for row in source["rows"] for cell in row["cells"]
+            if cell["cell"] in addresses and cell["value"].strip() and not cell.get("formula")]
 
 
 def normalize_evidence(line, source, file_id, page):
@@ -244,6 +316,7 @@ def normalize_evidence(line, source, file_id, page):
     evidence_items = [*line.evidence, *line.quantity_evidence, *line.dimension_evidence,
                       *(e for m in line.source_measurements for e in m.evidence),
                       *(e for c in line.components for e in c.evidence),
+                      *(e for req in line.production_requirements for e in req.evidence),
                       *(e for g in line.letter_groups for e in g.evidence)]
     evidence_items = [e for e in evidence_items if (e.file_id, e.page) == (file_id, page)]
     cells = source_cells(source)
@@ -255,12 +328,55 @@ def normalize_evidence(line, source, file_id, page):
             if sheet != source["sheet"] or evidence.sheet not in ("", sheet):
                 continue
         cell = cell.replace("$", "").upper()
-        if cell and cell not in cells:
+        if cell and cell not in cells and same_row_range(cell, source) is None:
             continue
         if evidence.sheet and evidence.sheet != source["sheet"]:
             continue
         evidence.sheet = source["sheet"]
         evidence.cell = cell
+    collections = [(line.evidence, 20), *((component.evidence, 10) for component in line.components),
+                   *((group.evidence, 10) for group in line.letter_groups),
+                   *((req.evidence, 5) for req in line.production_requirements),
+                   *((measurement.evidence, 3) for measurement in line.source_measurements)]
+    project_row = project_source_row(line, source)
+    for collection, limit in collections:
+        expanded = []
+        for evidence in collection:
+            if evidence not in evidence_items or evidence.sheet != source["sheet"] or evidence.source != "text":
+                expanded.append(evidence)
+                continue
+            selected = same_row_range(evidence.cell, source)
+            if selected and (project_row is None or coordinate_to_tuple(selected[1][0])[0] == project_row["row"]):
+                matches = [cell["cell"] for row in source["rows"] for cell in row["cells"]
+                           if cell["cell"] in selected[1] and not cell.get("formula")
+                           and evidence.text.strip() and evidence.text.strip() in cell["value"]]
+                if len(matches) == 1:
+                    replacements = [evidence.model_copy(update={"cell": matches[0], "source_range": selected[0]})]
+                elif collection is line.evidence:
+                    replacements = expand_source_evidence(evidence, source, selected[1], selected[0])
+                else:
+                    replacements = []
+            elif not evidence.cell and project_row is not None and collection is line.evidence:
+                addresses = [cell["cell"] for cell in project_row["cells"]]
+                replacements = expand_source_evidence(evidence, source, addresses)
+                warning = "模型遗漏单元格地址，已按本批唯一项目序号和名称恢复原文来源，识别字段仍需复核"
+                line.uncertainties = list(dict.fromkeys([*line.uncertainties, warning]))[:20]
+            else:
+                replacements = []
+            expanded.extend(replacements or [evidence])
+        unique = []
+        for evidence in expanded:
+            if evidence not in unique:
+                unique.append(evidence)
+        if len(unique) > limit:
+            raise ValueError("Excel来源展开超过字段允许数量，请缩小引用范围")
+        collection[:] = unique
+    evidence_items = [*line.evidence, *line.quantity_evidence, *line.dimension_evidence,
+                      *(e for m in line.source_measurements for e in m.evidence),
+                      *(e for c in line.components for e in c.evidence),
+                      *(e for req in line.production_requirements for e in req.evidence),
+                      *(e for g in line.letter_groups for e in g.evidence)]
+    evidence_items = [e for e in evidence_items if (e.file_id, e.page) == (file_id, page)]
     # First use an exact, unique quotation from actual cells, never guessed row numbers.
     for evidence in evidence_items:
         if evidence.cell or evidence.sheet != source["sheet"]:
@@ -272,20 +388,43 @@ def normalize_evidence(line, source, file_id, page):
             evidence.cell = matches[0]
     rows = {coordinate_to_tuple(e.cell)[0] for e in line.evidence
             if e in evidence_items and e.sheet == source["sheet"] and e.cell in cells}
+    if project_row is not None and rows and rows != {project_row["row"]}:
+        raise ValueError("Excel来源行与项目序号和名称不一致")
     if len(rows) == 1:
         row = next(iter(rows))
         columns, _ = table_columns(source)
+        row_cells = [cell for item in source["rows"] if item["row"] == row for cell in item["cells"]
+                     if cell["value"].strip() and not cell.get("formula")]
+        for evidence in evidence_items:
+            if evidence.sheet != source["sheet"] or evidence.source != "text":
+                continue
+            selected = same_row_range(evidence.cell, source)
+            if evidence.cell and selected is None:
+                continue
+            allowed = set(selected[1]) if selected else {cell["cell"] for cell in row_cells}
+            matches = [cell["cell"] for cell in row_cells if cell["cell"] in allowed
+                       and evidence.text.strip() and evidence.text.strip() in cell["value"]]
+            if len(matches) == 1:
+                if selected:
+                    evidence.source_range = selected[0]
+                evidence.cell = matches[0]
         count_cells = [c for item in source["rows"] if item["row"] == row for c in item["cells"]
                        if coordinate_to_tuple(c["cell"])[1] == columns.get("quantity") and not c.get("formula")]
         for evidence in line.quantity_evidence:
-            if evidence not in evidence_items or evidence.cell or evidence.source != "text":
+            selected = same_row_range(evidence.cell, source)
+            if (evidence not in evidence_items or evidence.cell and selected is None
+                    or evidence.source != "text" or evidence.sheet != source["sheet"]):
                 continue
             for cell in count_cells:
+                if selected and cell["cell"] not in selected[1]:
+                    continue
                 raw = unicodedata.normalize("NFKC", cell["value"]).strip()
                 claimed = unicodedata.normalize("NFKC", evidence.text).strip()
                 # A known project row disambiguates repeated scalar count cells.
                 if raw and (raw == claimed or re.fullmatch(
                         rf"{re.escape(raw)}\s*(?:个|件|套|组|块|只|台|张|樘|面)", claimed)):
+                    if selected:
+                        evidence.source_range = selected[0]
                     evidence.cell = cell["cell"]
         images = [item["cell"] for item in source["images"] if item["row"] == row]
         for evidence in evidence_items:
@@ -302,6 +441,7 @@ def table_columns(source):
         if plan.get("header_row") and "product" in plan["columns"]:
             return {field: coordinate_to_tuple(address)[1] for field, address in plan["columns"].items()}, plan["header_row"]
     aliases = {"item": {"序号", "编号", "项次"}, "product": {"名称", "项目名称", "产品名称", "产品", "品名"},
+               "code": {"项目编码", "项目代码", "图号", "图纸编号", "标识编号", "产品代码", "产品编码"},
                "type_note": {"类型", "类型备注", "产品类型"},
                "difficulty": {"难度", "工艺难度", "工艺难度备注", "难度等级"},
                "quantity": {"数量", "制作数量", "工程数量", "工程量", "采购数量", "订购数量",
@@ -333,9 +473,7 @@ def table_quantity(evidence, source):
     if unit_cell.get("formula"):
         return None
     unit = unicodedata.normalize("NFKC", unit_cell.get("value", "")).strip().lower()
-    units = {"个": "piece", "件": "piece", "只": "piece", "piece": "piece", "pieces": "piece",
-             "pc": "piece", "pcs": "piece", "套": "set", "set": "set", "sets": "set",
-             "组": "组", "块": "块", "台": "台", "张": "张", "樘": "樘", "面": "面"}
+    units = COUNT_ALIASES
     if unit and unit not in units:
         return None
     value = unicodedata.normalize("NFKC", cell["value"]).strip().lower()
@@ -361,13 +499,10 @@ def table_measurement(source, row_number, file_id, page):
         return None
     value = unicodedata.normalize("NFKC", quantity["value"]).strip()
     unit = unicodedata.normalize("NFKC", unit_cell["value"]).strip().lower() if unit_cell else ""
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z0-9²㎡\u4e00-\u9fff^]*)", value)
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z0-9²³㎡\u4e00-\u9fff^]*)", value)
     if not match:
         return None
-    factors = {"mm": ("m", ".001"), "毫米": ("m", ".001"), "cm": ("m", ".01"),
-               "厘米": ("m", ".01"), "m": ("m", "1"), "米": ("m", "1"),
-               "m2": ("m2", "1"), "m^2": ("m2", "1"), "平方米": ("m2", "1"),
-               "cm2": ("m2", ".0001"), "平方厘米": ("m2", ".0001")}
+    factors = ENGINEERING_FACTORS
     suffix = match[2].lower()
     if suffix and unit and factors.get(suffix) != factors.get(unit):
         return None
@@ -394,6 +529,8 @@ def financial_summary(name):
 def validate_excel_rows(result, sources):
     """Only recognizable customer-table columns supply conservative row fallbacks."""
     from .requirements_schemas import ExtractedLine, Evidence, QuantityEvidence
+    from .source_coverage import account_rows, row_kind
+    result = account_rows(result, sources)
     for (file_id, page), source in sources.items():
         if source.get("analysis_plan", {}).get("purpose") == "price_reference":
             result.lines = [line for line in result.lines if line.text_evidence or not line.evidence
@@ -408,6 +545,8 @@ def validate_excel_rows(result, sources):
             continue
         for row in source["rows"]:
             if row["row"] <= header_row:
+                continue
+            if row_kind(row, header_row, columns) == "non_product":
                 continue
             cells = {coordinate_to_tuple(cell["cell"])[1]: cell for cell in row["cells"]}
             name_cell = cells.get(columns["product"])
@@ -465,6 +604,10 @@ def validate_excel_rows(result, sources):
                                    for warning in line.uncertainties)
                     if count is not None and not conflict:
                         quantity_source.quantity = count
+                        unit_cell = cells.get(columns.get("unit"), {})
+                        unit_label = unicodedata.normalize("NFKC", unit_cell.get("value", "")).strip().lower()
+                        line.quantity_unit = (unit_label if re.search(r"[\u4e00-\u9fff]", unit_label)
+                                              else {"piece": "件", "set": "套"}.get(COUNT_ALIASES.get(unit_label), ""))
                         if line.quantity not in (None, count) or any(
                                 evidence.quantity != count for evidence in line.quantity_evidence
                                 if evidence.validation_status != "rejected"):
@@ -505,17 +648,30 @@ def validate_excel_rows(result, sources):
                             sheet=source["sheet"], cell=cell["cell"], text=value[:1500])][-20:]
     if len(result.lines) > 100:
         raise ValueError("Excel需求超过100行，请拆分会话")
-    return result
+    return account_rows(result, sources)
 
 
 def page_source(directory, page):
-    manifest = json.loads((directory / "excel.json").read_text(encoding="utf-8"))
+    from .excel_manifest import load_manifest
+    manifest = load_manifest(directory, upgrade=True)
     source = manifest["pages"][page - 1]
-    return {**source, "notice": manifest["notice"]}
+    return {**source, "notice": manifest["notice"], "parser_version": manifest.get("parser_version", 1),
+            "upgrade_status": manifest.get("upgrade_status", "")}
 
 
-def detail_images(directory, page, selection=None):
+def row_source(source, rows):
+    selected = set(rows)
+    _, header = table_columns(source)
+    return {**source, "rows": [row for row in source["rows"] if row["row"] in selected],
+            "header_rows": [row for row in source.get("header_rows", []) if row["row"] <= header],
+            "images": [image for image in source["images"] if image["row"] in selected],
+            "row_start": min(rows), "row_end": max(rows)}
+
+
+def detail_images(directory, page, selection=None, rows=None):
     source = page_source(directory, page)
+    if rows is not None:
+        source = row_source(source, rows)
     images = source["images"] if selection is None else source["images"][selection[0]:selection[1]]
     for item in images:
         with Image.open(directory / item["storage"]) as original:
@@ -528,10 +684,10 @@ def detail_images(directory, page, selection=None):
                    output.getvalue())
 
 
-def image_batches(directory, page):
+def image_batches(directory, page, rows=None):
     """Bound request memory and bytes, not the customer's total drawing count."""
     start, count, byte_size = 0, 0, 0
-    for index, (_, data) in enumerate(detail_images(directory, page)):
+    for index, (_, data) in enumerate(detail_images(directory, page, rows=rows)):
         if count and (count >= IMAGES_PER_BATCH or byte_size + len(data) > IMAGE_BATCH_BYTES):
             yield (start, index)
             start, count, byte_size = index, 0, 0

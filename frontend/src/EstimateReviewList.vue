@@ -12,6 +12,8 @@ const filters = [
   { value: 'reference', label: '引用价格' },
   { value: 'customer_confirmation', label: '待客户确认' }, { value: 'administrator_pricing', label: '待管理员核价' },
   { value: 'execution_error', label: '系统异常' },
+  { value: 'estimate_repair', label: '方案待修正' }, { value: 'recognition_review', label: '识别待核实' },
+  { value: 'service_unavailable', label: '服务不可用' },
 ]
 const visibleLines = computed(() => props.lines.filter(line => {
   if (!line.estimated && !line.blockers.length && !line.warnings?.length && !line.review_signals?.length) return false
@@ -20,7 +22,7 @@ const visibleLines = computed(() => props.lines.filter(line => {
   if (filter.value === 'quantity') return line.estimate_review?.some(item => item.field === 'quantity' && item.applied)
   if (filter.value === 'issues') return line.blockers.length || line.warnings?.length || line.review_signals?.length
   if (filter.value === 'reference') return line.estimate_costs?.some(cost => cost.source !== 'agent_estimate')
-  if (['customer_confirmation', 'administrator_pricing', 'execution_error'].includes(filter.value)) return line.resolution === filter.value
+  if (['customer_confirmation', 'administrator_pricing', 'execution_error', 'estimate_repair', 'recognition_review', 'service_unavailable'].includes(filter.value)) return line.resolution === filter.value
   return true
 }))
 const sources = { catalog: '报价库引用', historical: '历史案例引用', agent_estimate: '方案估价（非确认价格）' }

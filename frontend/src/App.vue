@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequirementsWorkspace from './RequirementsWorkspace.vue'
 import { costKinds } from './requirements-types'
+import { processLabels } from './generated-quote-contract'
 import {
   ArrowRight, BookOpen, Check, ChevronRight, CircleHelp, FileSpreadsheet,
   History, Lightbulb, ListFilter, LockKeyhole, LogOut, Menu, Moon, Pencil, Plus, RefreshCw, Search, ShieldCheck, Sun,
@@ -10,7 +11,7 @@ import {
 } from 'lucide-vue-next'
 import {
   api, kindLabels, languageLabels, ruleLabels, statusLabels, unitLabels,
-  type Audit, type Document, type Options, type Price, type Rule, type Source, type Stats,
+  type Audit, type CatalogContract, type Document, type Options, type Price, type Rule, type Source, type Stats,
 } from './api'
 
 type View = 'jobs' | 'prices' | 'rules' | 'documents' | 'audit'
@@ -25,7 +26,7 @@ function toggleTheme() {
 }
 applyTheme()
 const nav = [
-  { id: 'jobs' as View, label: '客户需求', icon: BookOpen },
+  { id: 'jobs' as View, label: '报价工作台', icon: BookOpen },
   { id: 'prices' as View, label: '价格明细', icon: TableProperties },
   { id: 'rules' as View, label: '规则与案例', icon: SlidersHorizontal },
   { id: 'documents' as View, label: '来源文件', icon: FileSpreadsheet },
@@ -78,6 +79,7 @@ const defaults = () => ({
   language: 'all', process: '', quality: '', unit: 'cm', amount: '' as string | null,
   price_kind: 'standard', status: 'active', notes: '', review_reason: '', revision: undefined as number | undefined,
   included_cost_kinds: [] as string[],
+  catalog_contract: undefined as CatalogContract | undefined,
 })
 const form = reactive(defaults())
 const ruleForm = reactive({
@@ -165,6 +167,11 @@ function editPrice(item?: Price) {
     }
     form.review_reason = ''
     form.included_cost_kinds = [...(item.included_cost_kinds || [])]
+    if (item.catalog_profile?.scope) {
+      form.catalog_contract = { cost_group: item.catalog_profile.cost_group,
+        pricing_scope: item.catalog_profile.scope, process_codes: [...item.catalog_profile.process_codes],
+        included_process_codes: [...item.catalog_profile.included_process_codes] }
+    }
   }
   formError.value = ''; priceDialog.value = true
 }
@@ -185,6 +192,11 @@ async function savePrice() {
     await reload()
   } catch (e) { formError.value = message(e) }
   finally { saving.value = false }
+}
+function addCatalogContract() {
+  const item = prices.value.find(row => row.id === editingId.value)
+  form.catalog_contract = { cost_group: item?.catalog_profile?.cost_group || 'finished',
+    pricing_scope: '', process_codes: [], included_process_codes: [] }
 }
 async function deactivate(item: Price | Rule, entity: 'prices' | 'rules') {
   try {
@@ -255,11 +267,11 @@ onUnmounted(() => {
       <el-input id="admin-token" v-model="loginToken" type="password" show-password autocomplete="current-password" size="large" placeholder="管理口令" />
       <div v-if="loginError" class="form-error" role="alert">{{ loginError }}</div>
       <el-button type="primary" native-type="submit" size="large" :loading="loginBusy"><LockKeyhole :size="16" />进入工作区<ArrowRight :size="16" /></el-button>
-      <div class="login-meta"><ShieldCheck :size="15" /> 本地管理端 <span>PostgreSQL</span></div>
+      <div class="login-meta"><ShieldCheck :size="15" /> 报价工作区</div>
     </form>
     <footer>萤火虫广告标识 · 价格与工艺资料库</footer>
   </div>
-  <div v-else class="app-shell">
+  <div v-else :class="['app-shell', { 'quote-focused': view === 'jobs' }]">
     <div v-if="mobileNav" class="nav-overlay" @click="mobileNav = false"></div>
     <aside class="sidebar" :class="{ 'mobile-open': mobileNav }">
       <div class="brand"><span class="brand-symbol"><Lightbulb :size="22" /></span><div><strong>萤火虫</strong><small>报价管理工作区</small></div><button class="icon-button mobile-close" aria-label="关闭导航" @click="mobileNav = false"><X :size="18" /></button></div>
@@ -271,13 +283,20 @@ onUnmounted(() => {
           <span v-if="item.id === 'prices'" class="nav-count">{{ stats.prices.toLocaleString() }}</span>
         </button>
       </nav>
-      <div class="sidebar-footer"><div class="db-indicator"><span></span> PostgreSQL <small>本地</small></div><button class="account" @click="logout"><span class="avatar">管</span><div>工作区管理员<small>local-admin</small></div><LogOut :size="16" /></button></div>
+      <div class="sidebar-footer"><button class="account" @click="logout"><span class="avatar">管</span><div>工作区管理员</div><LogOut :size="16" /></button></div>
     </aside>
     <div class="main-area">
       <header class="topbar">
         <button class="icon-button mobile-menu" aria-label="打开导航" @click="mobileNav = true"><Menu :size="20" /></button>
-        <div class="breadcrumb">报价资料库<ChevronRight :size="14" /><strong>{{ title }}</strong></div>
-        <div class="topbar-right"><span class="local-label"><span></span>本地工作区</span><el-tooltip :content="theme === 'dark' ? '切换日间模式' : '切换夜间模式'"><button class="icon-button bordered theme-toggle" :aria-label="theme === 'dark' ? '切换日间模式' : '切换夜间模式'" @click="toggleTheme"><Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" /></button></el-tooltip><span class="avatar small">管</span></div>
+        <div class="breadcrumb"><Lightbulb :size="18" /><strong>萤火虫</strong><ChevronRight :size="14" /><span>{{ title }}</span></div>
+        <div class="topbar-right">
+          <el-dropdown v-if="view === 'jobs'" @command="changeView">
+            <el-button class="management-menu" aria-label="资料管理"><SlidersHorizontal :size="16" />资料管理</el-button>
+            <template #dropdown><el-dropdown-menu><el-dropdown-item v-for="item in nav.filter(item => item.id !== 'jobs')" :key="item.id" :command="item.id"><component :is="item.icon" :size="15" />{{ item.label }}</el-dropdown-item></el-dropdown-menu></template>
+          </el-dropdown>
+          <el-tooltip :content="theme === 'dark' ? '切换日间模式' : '切换夜间模式'"><button class="icon-button bordered theme-toggle" :aria-label="theme === 'dark' ? '切换日间模式' : '切换夜间模式'" @click="toggleTheme"><Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" /></button></el-tooltip>
+          <el-tooltip content="退出工作区"><button class="icon-button" aria-label="退出工作区" @click="logout"><LogOut :size="17" /></button></el-tooltip>
+        </div>
       </header>
       <main>
         <RequirementsWorkspace v-if="view === 'jobs'" />
@@ -382,6 +401,17 @@ onUnmounted(() => {
         <el-form-item label="计价单位"><el-select v-model="form.unit"><el-option v-for="(label, key) in unitLabels" :key="key" :label="label" :value="key" /></el-select></el-form-item>
         <el-form-item label="价格性质"><el-select v-model="form.price_kind"><el-option v-for="(label, key) in kindLabels" :key="key" :label="label" :value="key" /></el-select></el-form-item>
         <el-form-item label="单价已含费用"><el-select v-model="form.included_cost_kinds" multiple aria-label="单价已含费用"><el-option v-for="kind in ['material', 'process', 'power', 'bracket', 'outsourcing']" :key="kind" :value="kind" :label="costKinds[kind]" /></el-select></el-form-item>
+        <el-form-item v-if="!form.catalog_contract"><el-button @click="addCatalogContract"><Plus :size="14" />维护计价范围</el-button></el-form-item>
+        <template v-if="form.catalog_contract">
+          <el-form-item label="价格用途"><el-select v-model="form.catalog_contract.cost_group" aria-label="价格用途">
+            <el-option value="finished" label="成品价格" /><el-option value="material_process" label="材料与工艺分项" />
+            <el-option value="assembly_reference" label="组合案例参考" /></el-select></el-form-item>
+          <el-form-item label="适用及包含范围" required><el-input v-model="form.catalog_contract.pricing_scope" type="textarea" aria-label="适用及包含范围" /></el-form-item>
+          <el-form-item label="适用工艺"><el-select v-model="form.catalog_contract.process_codes" multiple aria-label="适用工艺">
+            <el-option v-for="(label, code) in processLabels" :key="code" :value="code" :label="label" /></el-select></el-form-item>
+          <el-form-item label="价格已含工序"><el-select v-model="form.catalog_contract.included_process_codes" multiple aria-label="价格已含工序">
+            <el-option v-for="(label, code) in processLabels" :key="code" :value="code" :label="label" /></el-select></el-form-item>
+        </template>
         <el-form-item label="状态"><el-select v-model="form.status"><el-option v-for="(label, key) in statusLabels" :key="key" :label="label" :value="key" /></el-select></el-form-item>
       </div>
       <el-form-item label="备注"><el-input v-model="form.notes" type="textarea" :rows="3" maxlength="10000" /></el-form-item>

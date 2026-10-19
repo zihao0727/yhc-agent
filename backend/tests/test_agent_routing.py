@@ -111,10 +111,11 @@ def test_stalled_item_is_classified_as_execution_problem_not_customer_omission(
     current = client.get(f'/api/jobs/{job["id"]}').json()
     issue = current["agent_runs"][0]["usage"]["deferred_requirements"][0]
     assert issue["cause"] == "execution_error" and not issue["question"]
+    assert "连续操作未推进计价" in issue["reason"]
     assert len(seen) == 7
     assert current["quotes"][0]["payload"]["known_subtotal"] == "141.60"
     assert current["quotes"][0]["payload"]["total"] is None
-    assert current["quotes"][0]["payload"]["confirmation_items"][0]["owner"] == "报价管理员"
+    assert current["quotes"][0]["payload"]["confirmation_items"][0]["owner"] == "系统运维"
 
 
 def test_manual_resume_restores_failed_plan_and_candidate_without_resetting_facts(

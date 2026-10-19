@@ -78,7 +78,8 @@ def test_search_process_notes_terms_and_compact_results(client, price_input, mon
     audit_price = steps[0]["result"]["prices"][0]
     assert len(audit_price["notes"]) > 1000
     model_price = json.loads(seen[1][-1]["content"])["prices"][0]
-    assert "notes" not in model_price and "attributes" not in model_price
+    assert model_price["notes"] == audit_price["notes"][:1200]
+    assert "attributes" not in model_price
     assert model_price["has_conditions"] and model_price["id"] == price["id"]
 
 

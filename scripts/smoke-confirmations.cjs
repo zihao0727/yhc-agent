@@ -55,6 +55,7 @@ async function main() {
       if (pathname === '/api/session') body = { authenticated: true }
       else if (pathname === '/api/stats') body = { prices: 0, draft: 0, active: 0, inactive: 0, products: 0, rules: 0, documents: 0 }
       else if (pathname === '/api/options') body = { categories: [], products: [] }
+      else if (pathname === '/api/upload-config') body = {}
       else if (pathname.endsWith('model-config') || pathname.endsWith('embedding-config')) {
         body = { configured: true, model: 'mock-only', environment_managed: false }
       } else if (pathname === '/api/jobs') body = { items: [job], total: 1 }
@@ -62,15 +63,17 @@ async function main() {
       else throw new Error(`Unexpected API request: ${pathname}`)
       await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) })
     })
-    await page.goto(process.env.CONFIRMATIONS_UI_URL || 'http://127.0.0.1:5175')
+    await page.goto(process.env.CONFIRMATIONS_UI_URL || 'http://127.0.0.1:5173')
     await page.locator('.chat-history-item').first().click()
-    const table = page.locator('.chat-confirmation-details .confirmation-table')
-    await table.waitFor()
-    assert.equal(await table.locator('tbody tr').count(), 2, 'Duplicate legacy questions must not create duplicate rows')
-    assert.deepEqual(await table.locator('thead th').allTextContents(), ['序号', '项目', '问题与处理事项', '处理方'])
-    assert(await table.getByText('#12', { exact: true }).isVisible())
-    assert(await table.getByText('#13', { exact: true }).isVisible())
-    assert.equal(await table.locator('.confirmation-question').count(), 8)
+    const panel = page.locator('#workbench-supplement')
+    await panel.waitFor()
+    assert.equal(await panel.locator('.supplement-row').count(), 2, 'Duplicate legacy questions must not create duplicate rows')
+    assert.match(await panel.locator('.supplement-heading strong').first().textContent(), /#12/)
+    assert.match(await panel.locator('.supplement-heading strong').nth(1).textContent(), /#13/)
+    await panel.locator('.supplement-heading').nth(1).click()
+    assert.equal(await panel.locator('.supplement-question').count(), 4)
+    await panel.locator('.supplement-heading').first().click()
+    assert.equal(await panel.locator('.supplement-question').count(), 4)
     for (const [name, viewport] of [
       ['desktop', { width: 1440, height: 1000 }],
       ['tablet', { width: 768, height: 1024 }],
@@ -78,26 +81,19 @@ async function main() {
       ['narrow-mobile', { width: 320, height: 740 }],
     ]) {
       await page.setViewportSize(viewport)
-      await table.scrollIntoViewIfNeeded()
+      await panel.locator('.supplement-heading').first().scrollIntoViewIfNeeded()
       assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${name}: page overflow`)
-      assert(await table.evaluate(element => element.scrollWidth <= element.clientWidth + 1), `${name}: table overflow`)
-      if (viewport.width < 600) {
-        assert(await table.locator('.confirmation-mobile-owner').first().isVisible())
-        assert.equal(await table.locator('.confirmation-owner').first().isVisible(), false)
-      }
-      await table.screenshot({ path: path.join(output, `confirmations-${name}.png`), animations: 'disabled' })
+      assert(await panel.evaluate(element => element.scrollWidth <= element.clientWidth + 1), `${name}: panel overflow`)
+      await page.screenshot({ path: path.join(output, `confirmations-${name}.png`), animations: 'disabled' })
     }
     await page.setViewportSize({ width: 1440, height: 1000 })
-    await page.getByRole('button', { name: '补充后继续', exact: true }).click()
-    const dialogTable = page.locator('.el-dialog .confirmation-table')
-    await dialogTable.waitFor()
-    assert.equal(await dialogTable.locator('tbody tr').count(), 2)
-    await page.locator('.el-dialog').screenshot({ path: path.join(output, 'confirmations-review-dialog.png'), animations: 'disabled' })
-    await page.getByRole('button', { name: '稍后补充', exact: true }).click()
-    await page.getByRole('button', { name: '查看与审核报价', exact: true }).click()
-    await page.locator('.el-dialog, .el-drawer').filter({ has: page.locator('.confirmation-table') }).first().waitFor()
+    await page.getByRole('tab', { name: '报价结果', exact: true }).click()
+    await page.locator('.result-table').waitFor()
+    assert.equal(await page.locator('.result-table tbody tr').count(), 2)
+    await page.getByRole('button', { name: '查看待补充', exact: true }).click()
+    await panel.waitFor()
     assert.deepEqual(errors, [])
-    console.log('Confirmation table UI passed: deduplication, original item numbers, numbered points, desktop/tablet/mobile, review dialog and quote view')
+    console.log('PASS: actionable confirmations, deduplication, original item numbers, numbered questions, desktop/tablet/mobile and result navigation')
   } finally {
     await browser.close()
   }

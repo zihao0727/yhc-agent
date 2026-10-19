@@ -178,3 +178,30 @@ class AgentRun(Base):
     message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ExtractionBatch(Base):
+    __tablename__ = "extraction_batches"
+    __table_args__ = (UniqueConstraint("run_id", "batch_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    batch_key: Mapped[str] = mapped_column(String(255))
+    result: Mapped[dict] = mapped_column(JSON)
+    usage: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class PricingWorkItem(Base):
+    __tablename__ = "pricing_work_items"
+    __table_args__ = (UniqueConstraint("job_id", "line_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("requirement_jobs.id", ondelete="CASCADE"), index=True)
+    line_id: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    stage: Mapped[str] = mapped_column(String(30), default="research")
+    engine_version: Mapped[str] = mapped_column(String(50))
+    input_fingerprint: Mapped[str] = mapped_column(String(64))
+    dependencies: Mapped[dict] = mapped_column(JSON, default=dict)
+    blocker: Mapped[dict] = mapped_column(JSON, default=dict)
+    recovery: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)

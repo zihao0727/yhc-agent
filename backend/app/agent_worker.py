@@ -44,6 +44,8 @@ def run_pending_once(stop):
                         if not client.eval(RENEW, 1, key, owner):
                             lease_lost.set()
                             return
+                        from .worker_health import heartbeat as worker_heartbeat
+                        worker_heartbeat(active_run=run.id)
                     except (redis.RedisError, ConnectionError, TimeoutError):
                         lease_lost.set()
                         return
@@ -58,6 +60,8 @@ def run_pending_once(stop):
                 except (redis.RedisError, ConnectionError, TimeoutError):
                     return True
             try:
+                from .worker_health import heartbeat as worker_heartbeat
+                worker_heartbeat(active_run=run.id)
                 from .agent_loop import locked
                 job, run = locked(db, job.id, run.id)
                 run.usage = {**run.usage, "last_scheduled_at": time.time()}
@@ -70,6 +74,11 @@ def run_pending_once(stop):
                           request.get("replace", False), request.get("intent", "resume"),
                           interrupted=interrupted)
                 db.expire_all()
+                from .pricing_workflow import sync_work_items
+                current_job, current_run = db.get(RequirementJob, job.id), db.get(AgentRun, run.id)
+                if current_run.usage.get("workflow_version"):
+                    sync_work_items(db, current_job, current_run)
+                    db.commit()
                 save_checkpoint(db, db.get(RequirementJob, job.id), db.get(AgentRun, run.id))
             finally:
                 heartbeat_stop.set()
@@ -79,8 +88,20 @@ def run_pending_once(stop):
 
 
 def worker_loop(stop):
+    next_dependency_check = 0
     while not stop.is_set():
         try:
+            from .worker_health import heartbeat as worker_heartbeat, draining
+            worker_heartbeat()
+            if draining():
+                stop.wait(2)
+                continue
+            if time.monotonic() >= next_dependency_check:
+                from .pricing_workflow import reconcile_waiting_jobs
+                with SessionLocal() as db:
+                    reconcile_waiting_jobs(db)
+                    db.commit()
+                next_dependency_check = time.monotonic() + settings().agent_dependency_check_seconds
             run_pending_once(stop)
         except (redis.RedisError, ConnectionError) as exc:
             logger.exception("Redis connection failed; will retry: %s", exc)
@@ -94,3 +115,23 @@ def start_worker():
     thread = threading.Thread(target=worker_loop, args=(stop,), name="quote-worker", daemon=True)
     thread.start()
     return stop, thread
+
+
+def main():
+    import argparse
+    import signal
+    parser = argparse.ArgumentParser(description="Run the durable quotation worker independently of the API.")
+    parser.add_argument("--once", action="store_true", help="Process at most one saved scheduling slice.")
+    args = parser.parse_args()
+    stop = threading.Event()
+    for name in ("SIGINT", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: stop.set())
+    if args.once:
+        run_pending_once(stop)
+    else:
+        worker_loop(stop)
+
+
+if __name__ == "__main__":
+    main()

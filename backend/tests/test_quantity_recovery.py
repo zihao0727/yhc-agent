@@ -357,7 +357,7 @@ def test_uploaded_mixed_units_finish_recognition_without_quantity_failure(
         assert response.status_code == 200, response.text
         current = response.json()
         assert current["runs"][0]["status"] == "succeeded"
-    assert len(calls) == 4 and len(current["requirements"]) == 4
+    assert len(calls) == 1 and len(current["requirements"]) == 4
     by_name = {line["product"]: line for line in current["requirements"]}
     assert by_name["项目1"]["quantity"] is None and by_name["项目2"]["quantity"] is None
     assert by_name["项目3"]["quantity"] == 4

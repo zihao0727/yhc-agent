@@ -9,7 +9,40 @@ UNIT_LABELS = {
     "cm": "元/厘米", "m": "元/米", "m2": "元/平方米",
     "piece": "元/件", "set": "元/套", "fixed": "元/整项", "ratio": "比例",
     "hour": "元/小时",
+    "m3": "元/立方米", "kg": "元/千克",
 }
+
+
+def validate_component_coverage(line):
+    """A composite draft must account for its parts, not just describe them in scope."""
+    if line.estimate.contract_version < 3 or line.estimate.pricing_strategy != "composite":
+        return
+    from .pricing_errors import PricingError
+    ids = {component.object_id for component in line.components}
+    covered = set()
+    for index, cost in enumerate(line.estimate.costs):
+        if cost.target == "component":
+            covered.add(cost.target_id)
+        if not cost.covers_component_ids:
+            continue
+        if (cost.target != "item" or cost.kind != "finished"
+                or cost.measurement not in ("item_count", "fixed")
+                or not set(cost.covers_component_ids) <= ids):
+            raise PricingError(
+                "invalid_component_coverage",
+                "合并覆盖部件须使用整件成品费用并引用本项目部件object_id，不能以单项加工费声明整套已含",
+                [f"estimate.costs[{index}].covers_component_ids"],
+                action="complete_component_costs")
+        covered.update(cost.covers_component_ids)
+    missing = [(index, component) for index, component in enumerate(line.components)
+               if component.object_id not in covered]
+    if missing:
+        names = "、".join(component.name or component.object_id for _, component in missing)
+        raise PricingError(
+            "missing_component_costs",
+            "组合方案尚未覆盖这些部件的费用：" + names + "；请逐部件列费，不能只在scope中声称整套包含",
+            [f"components[{index}]" for index, _ in missing] + ["estimate.costs"],
+            action="complete_component_costs")
 
 
 def monomial(formula):
@@ -56,7 +89,7 @@ def validate_measurement(cost, line, reference, contract_version=1):
         unit = "piece" if unit == "unknown" else unit
     if unit not in UNIT_LABELS:
         raise ValueError(f"{cost.label}：缺少单价单位rate_unit，不能判断金额按件、厘米还是平方米计价")
-    if cost.source == "agent_estimate" and cost.expected_amount is None:
+    if cost.source == "agent_estimate" and cost.expected_amount is None and contract_version < 3:
         raise ValueError(f"{cost.label}：缺少费用校对金额expected_amount，请独立核对本项费用金额")
 
     expressions = {
@@ -68,8 +101,19 @@ def validate_measurement(cost, line, reference, contract_version=1):
         "set": ["=1"],
         "fixed": ["=1"],
         "ratio": ["=unit_subtotal", "=fixed_subtotal", "=order_subtotal"],
-        "hour": ["=labor_hours"],
+        "hour": ["=labor_hours"], "m3": [], "kg": [],
     }[unit]
+    if contract_version >= 3 and cost.measurement == "source_quantity":
+        from .source_quantities import source_measurement
+        source = source_measurement(line, cost.source_measurement_index)
+        expressions = ["=source_quantity"] if unit == source.unit else (
+            ["=source_quantity*100"] if source.unit == "m" and unit == "cm" else [])
+        if cost.basis != "total" or cost.target != "item":
+            raise ValueError("原表工程量必须按整行计费，不能再乘成品数量")
+    if contract_version >= 3 and cost.measurement == "item_area":
+        expressions = ["=area_m2"] if unit == "m2" else []
+    if contract_version >= 3 and cost.measurement == "item_length" and cost.target == "item":
+        expressions = ["=billing_length_mm/10"] if unit == "cm" else ["=billing_length_mm/1000"] if unit == "m" else []
     if cost.target == "component":
         expressions = {
             "m2": ["=billable_area_m2", "=area_m2*component_count",
@@ -81,10 +125,14 @@ def validate_measurement(cost, line, reference, contract_version=1):
             "hour": ["=labor_hours*component_count"],
             "fixed": ["=1"],
             "ratio": ["=unit_subtotal", "=fixed_subtotal", "=order_subtotal"],
-        }[unit]
+        }.get(unit, [])
     if cost.rate_basis_amount is not None and (
             cost.rate_basis_amount != cost.rate or cost.rate_basis_unit != unit):
         raise ValueError(f"{cost.label}：单价与结构化依据金额/单位不一致，不能把按件依据改成厘米费率")
+    if cost.measurement == "script":
+        if contract_version < 3:
+            raise ValueError("临时脚本须采用新计价契约")
+        return unit
     if cost.kind == "power":
         expressions = ["=power_units"] if unit == "piece" else []
     if cost.kind == "bracket" and unit != "m2":
@@ -139,7 +187,9 @@ def validate_cost_coverage(cost, index, previous, reference, measure=None):
             raise ValueError(f"{cost.label}：该费用类别已由费用{old_index + 1}包含，"
                              "不能重复计费；真实差价须指定adjusts_cost_index并说明依据")
         same_reference = (cost.source != "agent_estimate" and old["source"] == cost.source
-                          and old["reference_id"] == cost.reference_id)
+                          and old["reference_id"] == cost.reference_id and (
+                              old.get("reference_part") == cost.reference_part
+                              or old.get("reference_part") is None or cost.reference_part is None))
         same_estimate = (cost.source == old["source"] == "agent_estimate"
                          and old["label"] == cost.label and old["kind"] == cost.kind)
         same_measure = (monomial(old["quantity_formula"]) == monomial(cost.quantity_formula)

@@ -5,9 +5,10 @@ import unicodedata
 from decimal import Decimal, InvalidOperation
 
 from openpyxl.utils.cell import coordinate_to_tuple
+from .measurement_units import COUNT_ALIASES, ENGINEERING_FACTORS
 
 
-COUNT_UNITS = r"个|件|套|组|块|只|台|张|樘|面|pcs?|pieces?|sets?"
+COUNT_UNITS = "|".join(sorted(COUNT_ALIASES, key=len, reverse=True))
 ANNOTATION = re.compile(
     rf"(?:制作数量|采购数量|订购数量|数量|QTY|QUANTITY)\s*[:：=]?\s*"
     rf"([0-9]+(?:\.0+)?)\s*(?:({COUNT_UNITS})(?![A-Za-z0-9])|(?=$|[,，。;；\n]))",
@@ -45,8 +46,7 @@ def normalize_quantity_values(raw):
             count_unit = not suffix or re.fullmatch(COUNT_UNITS, suffix, re.I)
             if count_unit and amount == amount.to_integral_value():
                 entry["quantity"] = int(amount)
-            elif amount > 0 and (count_unit or suffix in {
-                    "mm", "cm", "m", "m2", "m^2", "毫米", "厘米", "米", "平方米"}):
+            elif amount > 0 and (count_unit or suffix in ENGINEERING_FACTORS):
                 entry["quantity"] = None
                 if entry is line and isinstance(line.get("uncertainties", []), list):
                     line["uncertainties"] = list(dict.fromkeys([*line.get("uncertainties", []),

@@ -136,8 +136,10 @@ def test_catalog_v2_accepts_equivalent_area_formula_and_preserves_unit(client, p
     price = client.post("/api/prices", json={**price_input, "status": "active", "unit": "m2", "amount": "100"}).json()
     requirement = line([fee(source="catalog", rate=100, rate_unit="m2", quantity_formula="=area_m2",
                             expected_amount=None, reference_id=price["id"], reference_revision=price["revision"])],
-                       width_mm=500, height_mm=400)
+                       width_mm=500, height_mm=400, material=price["material"])
     assert quote(test_db, requirement)["total"] == "40.00"
+    missing_material = quote(test_db, requirement.model_copy(update={"material": ""}))
+    assert missing_material["lines"][0]["diagnostics"][0]["code"] == "missing_target_material"
 
 
 def test_declared_finished_coverage_prevents_duplicate_processing(test_db):
@@ -163,7 +165,7 @@ def test_reference_coverage_prevents_duplicates(client, price_input, test_db):
     costs = [fee(source="catalog", rate=100, rate_unit="m2", quantity_formula="=area_m2",
                  expected_amount=None, reference_id=price["id"], reference_revision=price["revision"]),
              fee(label="再次加工", kind="process")]
-    result = quote(test_db, line(costs, width_mm=500, height_mm=400))
+    result = quote(test_db, line(costs, width_mm=500, height_mm=400, material=price["material"]))
     assert result["total"] is None and "已由费用" in result["lines"][0]["blockers"][0]
 
 
@@ -260,6 +262,36 @@ def test_customer_deferral_cannot_claim_known_quantity_is_missing():
         reason="缺数量", question="多少件？", missing_fields=["quantity"]))
     assert result["known_fields"] == ["quantity"]
     assert not agent_work_state.deferred_lines(job, run)
+
+
+@pytest.mark.parametrize("reason", [
+    "各型数量仍在核对点位与套数组成，暂未核清",
+    "系统尚未核清原件中的分型数量",
+    "尚未核对原图中的每套构成",
+    "分型数量继续由系统查阅全册点位",
+])
+def test_unfinished_source_review_cannot_be_deferred_to_customer(reason):
+    requirement = line().model_dump(mode="json")
+    job = SimpleNamespace(requirements=[requirement], messages=[])
+    run = SimpleNamespace(usage={})
+    before = deepcopy(requirement)
+    result = defer_requirement(job, run, DeferInput(line_id="generic", cause="customer_input",
+        reason=reason, question="各型各多少？", missing_fields=["分型数量"]))
+    assert result["cause"] == "recognition_review"
+    assert result["owner"] == "系统核查"
+    assert not agent_work_state.deferred_lines(job, run)
+    assert job.requirements == [before] and not job.messages
+
+
+def test_verified_missing_customer_fact_can_still_be_deferred():
+    requirement = line(quantity=None).model_dump(mode="json")
+    job = SimpleNamespace(requirements=[requirement], messages=[])
+    run = SimpleNamespace(usage={})
+    result = defer_requirement(job, run, DeferInput(line_id="generic", cause="customer_input",
+        reason="已核对清单及全部关联图纸，均未提供订购数量",
+        question="请提供订购数量。", missing_fields=["quantity"]))
+    assert result["deferred"] and result["cause"] == "customer_input"
+    assert agent_work_state.deferred_lines(job, run)[0]["line_id"] == "generic"
 
 
 def test_repair_progress_is_bounded_and_repeated_candidates_do_not_reset_idle():
@@ -365,7 +397,8 @@ def test_malformed_legacy_catalog_coverage_does_not_crash(client, price_input, t
         row = db.get(PriceItem, price["id"])
         row.attributes = {"included_cost_kinds": value}
     price = client.get(f'/api/prices/{price["id"]}').json()
-    requirement = line([fee(source="catalog", reference_id=price["id"], reference_revision=price["revision"])])
+    requirement = line([fee(source="catalog", reference_id=price["id"], reference_revision=price["revision"])],
+                       material=price["material"])
     assert (quote(test_db, requirement)["total"] is None) == blocked
 
 
@@ -430,7 +463,8 @@ def test_generic_catalog_update_invalidates_old_snapshot(client, price_input):
         **price_input, "status": "active", "unit": "piece", "amount": "10"}).json()
     job = prepared(client)
     requirement = line([fee(source="catalog", reference_id=price["id"],
-                            reference_revision=price["revision"])]).model_dump(mode="json")
+                            reference_revision=price["revision"])],
+                       material=price["material"]).model_dump(mode="json")
     requirement["evidence"] = job["requirements"][0]["evidence"]
     job = save_lines(client, job, [requirement])
     response = client.post(f'/api/jobs/{job["id"]}/quotes', json={
@@ -448,8 +482,8 @@ def test_invalid_formula_is_not_automatically_a_customer_question(test_db):
     payload = quote(test_db, line([fee(rate_unit="cm", quantity_formula="=1")]))
     assert payload["total"] is None
     item = payload["confirmation_items"][0]
-    assert item["owner"] == "报价管理员"
-    assert item["cause"] == "execution_error"
+    assert item["owner"] == "系统核价"
+    assert item["cause"] == "plan_repair"
 
 
 def test_equivalent_formulas_do_not_bypass_duplicate_fee_check(test_db):

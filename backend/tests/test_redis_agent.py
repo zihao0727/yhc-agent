@@ -59,6 +59,11 @@ def test_each_item_persisted_in_redis_and_only_full_order_finishes(
         current = client.get(f'/api/jobs/{job["id"]}').json()
         assert current["status"] == "processing" and not current["quotes"]
         assert current["agent_runs"][0]["id"] == run_id
+        display = current["pricing_progress"]["lines"]
+        assert display[i]["amount"] == "141.60"
+        assert display[i]["unit_price"] is not None
+        assert display[i]["effective_requirement"]["width_mm"] == saved["effective_requirement"]["width_mm"]
+        assert "requirement" not in display[i]
     agent_worker.run_pending_once(threading.Event())
     current = client.get(f'/api/jobs/{job["id"]}').json()
     assert current["status"] == "quoted"
@@ -206,6 +211,7 @@ def test_durable_extraction_usage_does_not_exhaust_pricing_budget(
 ])
 def test_durable_protection_reports_specific_cause_and_preserves_state(
         client, monkeypatch, redis_worker, test_db, counter, value, reason):
+    monkeypatch.setattr(settings(), "agent_compact_plans", False)
     monkeypatch.setattr(settings(), "agent_max_total_tokens", 1000000)
     seen = provider(monkeypatch, [])
     job = enqueue(client, monkeypatch, 1)

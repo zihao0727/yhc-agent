@@ -1,4 +1,5 @@
 """Check estimate evidence against immutable uploads, not model-generated narratives."""
+import re
 from .customer_files import pdf_page_text, storage_path
 from .customer_excel import MEDIA_TYPE, page_source, validate_evidence
 from .pricing_strategies import target_object
@@ -7,6 +8,24 @@ from .pricing_strategies import target_object
 def validate_estimate_evidence(line, files):
     if not line.estimate:
         return
+    from .estimate_compiler import bind_target, with_proposed_objects
+    from .requirements_schemas import EstimateAssumption
+    original_evidence = line.evidence
+    line = with_proposed_objects(line)
+    for index, assumption in enumerate(line.estimate.assumptions):
+        bind_target(line, assumption, f"estimate.assumptions[{index}]", line.estimate.contract_version >= 3)
+    for kind in ("components", "letter_groups"):
+        for obj in getattr(line.estimate, "proposed_" + kind):
+            for evidence in obj.evidence:
+                if not any(e.file_id == evidence.file_id and e.page == evidence.page
+                           and (not evidence.sheet or e.sheet == evidence.sheet)
+                           and (not evidence.cell or e.cell and
+                                re.sub(r"\D", "", e.cell) == re.sub(r"\D", "", evidence.cell))
+                           for e in original_evidence):
+                    raise ValueError("新增对象引用了其他项目的来源")
+            line.estimate.assumptions.append(EstimateAssumption(
+                field="material", value="source_check", mode="correct", previous_value="",
+                reason="新增对象来源校验", evidence=obj.evidence))
     cached = {}
     for assumption in line.estimate.assumptions:
         for evidence in assumption.evidence:

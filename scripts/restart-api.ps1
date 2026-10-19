@@ -21,7 +21,15 @@ for ($i = 0; $i -lt 20; $i++) {
 if (Get-NetTCPConnection -State Listen -LocalPort $state.apiPort -ErrorAction SilentlyContinue) {
     throw "API port remains in use; no unrelated process was stopped."
 }
-$api = Start-Process -FilePath $python -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "$($state.apiPort)") -WorkingDirectory (Join-Path $root "backend") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runtime "api.out.log") -RedirectStandardError (Join-Path $runtime "api.err.log")
+$priorMode = $env:AGENT_WORKER_MODE
+try {
+    $env:AGENT_WORKER_MODE = "external"
+    $api = Start-Process -FilePath $python -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "$($state.apiPort)") -WorkingDirectory (Join-Path $root "backend") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runtime "api.out.log") -RedirectStandardError (Join-Path $runtime "api.err.log")
+    $workerId = & (Join-Path $PSScriptRoot "start-quote-worker.ps1") -Root $root
+} finally {
+    $env:AGENT_WORKER_MODE = $priorMode
+}
 $state.api = $api.Id
+$state | Add-Member -NotePropertyName worker -NotePropertyValue $workerId -Force
 $state | ConvertTo-Json | Set-Content -LiteralPath $statePath
 Write-Output "API restarted at http://127.0.0.1:$($state.apiPort)"

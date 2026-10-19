@@ -50,19 +50,98 @@ def check_revision(job, revision):
 def public_file(file):
     data = snapshot(file)
     data.pop("storage_key")
+    if file.media_type == EXCEL_MEDIA_TYPE:
+        try:
+            from .excel_manifest import load_manifest
+            manifest = load_manifest(storage_path(file.storage_key))
+            data["parser_version"] = manifest.get("parser_version", 1)
+            data["resource_summary"] = manifest.get("resource_summary")
+            data["conversion"] = manifest.get("conversion")
+        except (OSError, ValueError):
+            data["resource_summary"] = None
+            data["parser_version"] = 0
     return data
 
 
+@router.get("/jobs/{job_id}/file-workspace")
+def file_workspace(job_id: int, db: DB):
+    from .file_workspace import workspace_info
+    job_for(db, job_id)
+    files = list(db.scalars(select(CustomerFile).where(CustomerFile.job_id == job_id)))
+    result = workspace_info(job_id, files)
+    result.pop("extraction_schema", None)
+    result.pop("instructions", None)
+    return result
+
+
+@router.get("/jobs/{job_id}/file-workspace/{artifact_id}")
+def file_workspace_artifact(job_id: int, artifact_id: str, db: DB, offset: int = Query(default=0, ge=0),
+                            section: Literal["result", "script"] = "result"):
+    from .file_workspace import ArtifactInput, artifact_page
+    job_for(db, job_id)
+    try:
+        return artifact_page(job_id, ArtifactInput(artifact_id=artifact_id, offset=offset, section=section))
+    except ValueError as exc:
+        raise HTTPException(404, "工作区记录不存在") from exc
+
+
+@router.get("/jobs/{job_id}/pipeline-audit")
+def pipeline_audit(job_id: int, db: DB):
+    from .pipeline_audit import shadow_line, run_metrics
+    job = job_for(db, job_id)
+    run = db.scalar(select(AgentRun).where(AgentRun.job_id == job_id).order_by(AgentRun.id.desc()).limit(1))
+    rows = [shadow_line(db, raw) for raw in job.requirements]
+    return {"job_id": job.id, "revision": job.revision, "read_only": True,
+            "engine": "measurement.v3", "lines": rows,
+            "coverage": job.extraction.get("source_coverage", []),
+            "source_links": job.extraction.get("source_links", []),
+            "source_agent": job.extraction.get("source_agent"),
+            "files": [public_file(f) for f in db.scalars(select(CustomerFile).where(CustomerFile.job_id == job_id))],
+            "metrics": run_metrics(run) if run else None,
+            "requires_review": sum(row["status"] != "unchanged" or bool(row.get("review_signals")) for row in rows)}
+
+
+@router.post("/customer-files/{file_id}/reparse-preview")
+def reparse_preview(file_id: int, db: DB):
+    import tempfile
+    from pathlib import Path
+    from .customer_documents import prepare_normalized
+    file = db.get(CustomerFile, file_id)
+    if not file or file.media_type != EXCEL_MEDIA_TYPE:
+        raise HTTPException(404, "Excel文件不存在")
+    with tempfile.TemporaryDirectory(prefix="firefly-parse-audit-") as temporary:
+        directory = Path(temporary)
+        stored = storage_path(file.storage_key)
+        source = stored / ("normalized.xlsx" if (stored / "normalized.xlsx").is_file() else "original")
+        conversion = (json.loads((stored / "conversion.json").read_text(encoding="utf-8"))
+                      if (stored / "conversion.json").is_file() else None)
+        prepare_normalized(source.read_bytes(), directory, conversion)
+        manifest = json.loads((directory / "excel.json").read_text(encoding="utf-8"))
+        return {"read_only": True, "file_id": file.id, "parser_version": manifest["parser_version"],
+                "page_count": len(manifest["pages"]), "resource_summary": manifest["resource_summary"],
+                "unresolved": [a for page in manifest["pages"] for a in page["resource_audit"]
+                               if a["status"] != "resolved"]}
+
+
 def view_quote(db, quote, job):
-    return {**snapshot(quote), "outdated": quote_stale(db, quote, job)}
+    from .quote_presentation import enrich_legacy_issues
+    run = db.get(AgentRun, quote.payload["agent_run_id"]) if quote.payload.get("agent_run_id") else None
+    return {**snapshot(quote), "outdated": quote_stale(db, quote, job),
+            "payload": enrich_legacy_issues(quote.payload, run)}
 
 
 def public_usage(usage, job=None, run=None):
     data = {key: value for key, value in usage.items()
-            if key not in ("extraction_checkpoint", "work_state")}
+            if key not in ("extraction_checkpoint", "extraction_input", "work_state",
+                           "pricing_request_owner")}
     if job is not None and run is not None:
-        from .agent_work_state import deferred_lines
-        data["deferred_requirements"] = deferred_lines(job, run)
+        from .agent_work_state import deferred_lines, line_state
+        from .quote_presentation import pending_inputs
+        raw_by_id = {raw["id"]: raw for raw in job.requirements}
+        data["deferred_requirements"] = [
+            {**issue, "inputs": pending_inputs(raw_by_id[issue["line_id"]],
+                                             line_state(job, run, issue["line_id"]))}
+            for issue in deferred_lines(job, run)]
     return data
 
 
@@ -72,21 +151,37 @@ def view_job(db, job, detail=False):
     data["file_count"] = db.scalar(select(func.count()).select_from(CustomerFile).where(CustomerFile.job_id == job.id))
     data["pending_count"] = sum(bool(missing_requirements(RequirementLine.model_validate(line))) for line in job.requirements)
     if detail:
+        data["requirements"] = [RequirementLine.model_validate(raw).model_dump(mode="json")
+                                for raw in job.requirements]
+        runs = list(db.scalars(select(AgentRun).where(
+            AgentRun.job_id == job.id).order_by(AgentRun.id.desc()).limit(10)))
         data["pricing_progress"] = None
         if settings().agent_background:
             from .agent_checkpoints import read_checkpoint
+            from .quote_presentation import compact_progress
             try:
-                progress = read_checkpoint(job.id)
-                if progress and progress["revision"] == job.revision:
-                    data["pricing_progress"] = progress
+                progress = read_checkpoint(job.id, include_lines=True)
+                if (progress and progress["revision"] == job.revision
+                        and (not runs or progress.get("run_id") == runs[0].id)):
+                    data["pricing_progress"] = compact_progress(progress)
             except (redis.RedisError, ValueError, KeyError, TypeError):
                 pass  # SQL remains available while the worker repairs Redis.
-        data["agent_runs"] = [{**snapshot(r), "usage": public_usage(r.usage, job, r)}
-                              for r in db.scalars(select(AgentRun).where(
-            AgentRun.job_id == job.id).order_by(AgentRun.id.desc()).limit(10))]
+        extracting = bool(runs and runs[0].usage.get("extraction_input") and not runs[0].usage.get("prepared"))
+        if extracting:
+            data["pricing_progress"] = {"line_count": len(job.requirements), "priced_count": 0,
+                                        "known_subtotal": "0", "complete": False,
+                                        "saved_at": job.updated_at.timestamp(), "lines": []}
+        if not extracting and data["pricing_progress"] is None and any(
+                raw.get("estimate") or raw.get("manual_unit_price") is not None or raw.get("selected_price_id")
+                for raw in job.requirements):
+            from .quote_presentation import compact_progress, sql_progress
+            data["pricing_progress"] = compact_progress(sql_progress(db, job))
+        data["agent_runs"] = [{**snapshot(r), "usage": public_usage(r.usage, job, r)} for r in runs]
         data["files"] = [public_file(f) for f in db.scalars(select(CustomerFile).where(CustomerFile.job_id == job.id).order_by(CustomerFile.id))]
         data["runs"] = [snapshot(r) for r in db.scalars(select(ExtractionRun).where(ExtractionRun.job_id == job.id).order_by(ExtractionRun.id.desc()).limit(20))]
         data["quotes"] = [view_quote(db, q, job) for q in db.scalars(select(QuoteDraft).where(QuoteDraft.job_id == job.id).order_by(QuoteDraft.version.desc()))]
+        from .quote_workspace import build_workspace
+        data["quote_workspace"] = build_workspace(db, job, runs[0] if runs else None, data["quotes"])
     else:
         for key in ("extraction", "requirements", "messages", "brief"):
             data.pop(key)
@@ -103,24 +198,29 @@ def job_progress(job_id: int, db: DB, run_id: int = 0, after: int = Query(defaul
     if settings().agent_background:
         from .agent_checkpoints import read_checkpoint
         try:
-            candidate = read_checkpoint(job.id)
-            if candidate and candidate["revision"] == job.revision:
+            candidate = read_checkpoint(job.id, include_lines=True)
+            if (candidate and candidate["revision"] == job.revision
+                    and (not run or candidate.get("run_id") == run.id)):
                 progress = candidate
         except (redis.RedisError, ValueError, KeyError, TypeError):
             pass  # Fall back to recomputing from SQL.
+    if run and run.usage.get("extraction_input") and not run.usage.get("prepared"):
+        progress = {"line_count": len(job.requirements), "priced_count": 0, "known_subtotal": "0",
+                    "complete": False, "saved_at": job.updated_at.timestamp(), "lines": []}
     if progress is None:
-        from decimal import Decimal
-        from .quote_engine import calculate_line
-        lines = [calculate_line(db, RequirementLine.model_validate(raw), automatic=True)
-                 for raw in job.requirements]
-        progress = {"line_count": len(lines),
-                    "priced_count": sum(line["amount"] is not None for line in lines),
-                    "known_subtotal": str(sum((Decimal(line["amount"]) for line in lines
-                                              if line["amount"] is not None), Decimal(0))),
-                    "complete": bool(lines) and all(line["amount"] is not None and not line["blockers"] for line in lines),
-                    "saved_at": job.updated_at.timestamp()}
+        from .quote_presentation import sql_progress
+        progress = sql_progress(db, job)
+    from .quote_presentation import compact_progress
+    progress = compact_progress(progress)
     result = {"id": job.id, "revision": job.revision, "status": job.status,
+              "messages": [{k: v for k, v in m.items() if k != "tool_audit"} for m in job.messages],
               "pricing_progress": progress, "run": None, "server_time": time.time()}
+    from .quote_workspace import build_workspace
+    from .quote_presentation import sql_progress
+    current_quotes = [view_quote(db, quote, job) for quote in db.scalars(
+        select(QuoteDraft).where(QuoteDraft.job_id == job.id).order_by(QuoteDraft.version.desc()).limit(1))]
+    result["quote_workspace"] = build_workspace(db, job, run, current_quotes,
+                                               sql_progress(db, job) if not job.extraction.get("incomplete") else None)
     if run:
         usage = public_usage(run.usage, job, run)
         phase = usage.get("phase", "queued") if run.status == "processing" else run.status
@@ -141,6 +241,15 @@ def job_progress(job_id: int, db: DB, run_id: int = 0, after: int = Query(defaul
     return result
 
 
+@router.get("/jobs/{job_id}/requirements-page")
+def requirements_page(job_id: int, db: DB, offset: int = Query(default=0, ge=0),
+                      limit: int = Query(default=50, ge=1, le=100)):
+    job = job_for(db, job_id)
+    return {"revision": job.revision, "total": len(job.requirements),
+            "incomplete": bool(job.extraction.get("incomplete")),
+            "lines": job.requirements[offset:offset + limit]}
+
+
 @router.get("/jobs/{job_id}/agent-runs/{run_id}/steps/{index}")
 def agent_step(job_id: int, run_id: int, index: int, db: DB):
     run = db.scalar(select(AgentRun).where(AgentRun.id == run_id, AgentRun.job_id == job_id))
@@ -153,6 +262,14 @@ def agent_step(job_id: int, run_id: int, index: int, db: DB):
 def model_config():
     return {"configured": bool(deepseek.get_key()), "model": settings().deepseek_model,
             "provider": "DeepSeek", "environment_managed": bool(settings().deepseek_api_key)}
+
+
+@router.get("/upload-config")
+def upload_config():
+    config = settings()
+    return {"max_files": 6, "max_file_bytes": config.max_upload_bytes,
+            "max_pdf_bytes": config.max_pdf_upload_bytes, "max_job_bytes": config.max_job_upload_bytes,
+            "max_pages": config.max_job_pages, "max_lines": config.max_requirement_lines}
 
 
 @router.put("/model-config")
@@ -220,14 +337,14 @@ def create_job(db: DB, title: Annotated[str, Form(max_length=150)],
         total_size, total_pages = 0, 0
         hashes = set()
         for upload in files:
-            data = upload.file.read(settings().max_upload_bytes + 1)
-            result = prepare_file(data, upload.filename or "customer-file")
+            result = prepare_file(upload.file, upload.filename or "customer-file")
             prepared.append(result)
             total_size += result["byte_size"]
             if result["media_type"] != EXCEL_MEDIA_TYPE:
                 total_pages += result["page_count"]
-            if total_size > 50 * 1024 * 1024 or total_pages > settings().max_job_pages:
-                raise FileRejected("任务文件合计不能超过50MB；图片/PDF合计不能超过20页（不含Excel自动分页）")
+            if total_size > settings().max_job_upload_bytes or total_pages > settings().max_job_pages:
+                raise FileRejected(f"任务文件合计不能超过{settings().max_job_upload_bytes // (1024 * 1024)}MB；"
+                                   f"图片/PDF合计不能超过{settings().max_job_pages}页（不含Excel自动分页）")
             if result["sha256"] in hashes:
                 raise FileRejected("同一任务不能重复上传相同文件")
             hashes.add(result["sha256"])
@@ -326,15 +443,16 @@ def append_files(job_id: int, db: DB, revision: Annotated[int, Form()],
         size = sum(f.byte_size for f in existing)
         pages = sum(f.page_count for f in existing if f.media_type != EXCEL_MEDIA_TYPE)
         for upload in files:
-            item = prepare_file(upload.file.read(settings().max_upload_bytes + 1), upload.filename or "customer-file")
+            item = prepare_file(upload.file, upload.filename or "customer-file")
             prepared.append(item)
             size += item["byte_size"]
             if item["media_type"] != EXCEL_MEDIA_TYPE:
                 pages += item["page_count"]
             if item["sha256"] in hashes:
                 raise FileRejected("该文件已在当前会话中")
-            if size > 50 * 1024 * 1024 or pages > settings().max_job_pages:
-                raise FileRejected("会话文件合计不能超过50MB；图片/PDF合计不能超过20页（不含Excel自动分页）")
+            if size > settings().max_job_upload_bytes or pages > settings().max_job_pages:
+                raise FileRejected(f"会话文件合计不能超过{settings().max_job_upload_bytes // (1024 * 1024)}MB；"
+                                   f"图片/PDF合计不能超过{settings().max_job_pages}页（不含Excel自动分页）")
             hashes.add(item["sha256"])
         before = snapshot(job)
         added = [CustomerFile(job_id=job_id, **item) for item in prepared]
@@ -367,6 +485,18 @@ def preview(file_id: int, page: int, db: DB):
     if not file or not 1 <= page <= file.page_count:
         raise HTTPException(404, "文件页不存在")
     path = storage_path(file.storage_key) / f"page-{page}.png"
+    if file.media_type == "application/pdf":
+        from .customer_files import ensure_pdf_preview
+        try:
+            path = ensure_pdf_preview(file, page)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(422, "PDF 当前页无法渲染，请检查原文件") from exc
+    if file.media_type == EXCEL_MEDIA_TYPE:
+        from .excel_manifest import ensure_preview
+        try:
+            path = ensure_preview(storage_path(file.storage_key), page)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(422, "Excel 当前预览无法生成，请检查原文件") from exc
     if not path.exists():
         raise HTTPException(404, "预览文件已丢失")
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
@@ -385,6 +515,28 @@ def customer_source(file_id: int, page: int, db: DB):
     return source
 
 
+@router.get("/customer-files/{file_id}/pages/{page}/region")
+def preview_region(file_id: int, page: int, db: DB,
+                   left: Annotated[float, Query(ge=0, le=1)],
+                   top: Annotated[float, Query(ge=0, le=1)],
+                   right: Annotated[float, Query(ge=0, le=1)],
+                   bottom: Annotated[float, Query(ge=0, le=1)]):
+    file = db.get(CustomerFile, file_id)
+    if not file or not 1 <= page <= file.page_count:
+        raise HTTPException(404, "文件或页码不存在")
+    if file.media_type != "application/pdf" and not file.media_type.startswith("image/"):
+        raise HTTPException(422, "仅图片及PDF支持区域预览")
+    if right <= left or bottom <= top:
+        raise HTTPException(422, "区域坐标顺序无效")
+    from .customer_files import visual_region_content
+    try:
+        _, pixels = visual_region_content(file, page, (left, top, right, bottom))
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(422, "区域无法读取，请核对原件") from exc
+    return Response(pixels, media_type="image/png",
+                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
 @router.get("/customer-files/{file_id}/images/{name}")
 def customer_drawing(file_id: int, name: str, db: DB):
     import re
@@ -400,6 +552,9 @@ def customer_drawing(file_id: int, name: str, db: DB):
 
 @router.post("/jobs/{job_id}/extract")
 def extract_job(job_id: int, data: RunInput, db: DB):
+    if settings().agent_background or settings().source_agent_enabled:
+        return agent_job(job_id, data.model_copy(update={
+            "intent": "resume" if data.intent == "resume" else "extract"}), db, extraction_only=True)
     job = job_for(db, job_id, True)
     check_revision(job, data.revision)
     if not data.allow_external_processing:
@@ -488,7 +643,7 @@ def recover_job(job_id: int, data: DeleteInput, db: DB):
 
 
 @router.post("/jobs/{job_id}/agent")
-def agent_job(job_id: int, data: RunInput, db: DB):
+def agent_job(job_id: int, data: RunInput, db: DB, extraction_only: bool = False):
     from .agent_loop import run_agent
     from .agent_requests import resolve_agent_intent
     job = job_for(db, job_id, True)
@@ -508,15 +663,25 @@ def agent_job(job_id: int, data: RunInput, db: DB):
                                       data.replace_existing, data.intent)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if intent == "extract" and job.requirements and not data.replace_existing:
+    source_audit = job.extraction.get("source_agent") or {}
+    incomplete_resume = bool(job.extraction.get("incomplete") or source_audit.get("unreviewed_pages")
+        or source_audit.get("inventory", {}).get("issues")) and intent == "resume"
+    if incomplete_resume:
+        intent = "extract"
+    if intent == "extract" and job.requirements and not data.replace_existing and not incomplete_resume:
         raise HTTPException(409, "补充识别会替换需求，请确认")
     run = AgentRun(job_id=job_id, model=settings().deepseek_model)
+    from .pricing_contract import WORKSPACE_VERSION
+    run.usage = {"external_processing_authorized": True, "auto_resume": True,
+                 "workflow_version": WORKSPACE_VERSION}
     if settings().agent_background:
-        run.usage = {"durable": True, "phase": "queued", "request": {
+        run.usage = {**run.usage, "durable": True, "phase": "queued", "request": {
             "supplementary": data.supplementary_text,
             "replace": data.replace_existing if intent == "extract" else False,
             "intent": intent}}
-        run.message = "后台报价已启动，逐项存入Redis，全部计费后提交人工审核。"
+        run.message = "后台资料整理已启动，按页保存识别结果。" if extraction_only else "后台报价已启动，逐批保存资料及计费进度。"
+    if extraction_only:
+        run.usage = {**(run.usage or {}), "extraction_only": True}
     db.add(run)
     job.status = "processing"
     if data.supplementary_text:
@@ -551,6 +716,10 @@ def stop_agent(job_id: int, data: DeleteInput, db: DB):
 def update_requirements(job_id: int, data: RequirementsUpdate, db: DB):
     job = job_for(db, job_id, True)
     check_revision(job, data.revision)
+    if job.extraction.get("incomplete"):
+        raise HTTPException(409, "资料尚未全部识别，请先继续整理剩余页面")
+    if len(data.lines) > settings().max_requirement_lines:
+        raise HTTPException(422, "明细数量超过任务上限")
     if len({line.id for line in data.lines}) != len(data.lines):
         raise HTTPException(422, "需求行编号不能重复")
     valid_files = {f.id: f for f in db.scalars(select(CustomerFile).where(CustomerFile.job_id == job.id))}
@@ -565,6 +734,7 @@ def update_requirements(job_id: int, data: RequirementsUpdate, db: DB):
         for evidence in [*line.evidence, *line.quantity_evidence, *line.dimension_evidence,
                          *(e for measurement in line.source_measurements for e in measurement.evidence),
                          *(e for component in line.components for e in component.evidence),
+                         *(e for requirement in line.production_requirements for e in requirement.evidence),
                          *(e for group in line.letter_groups for e in group.evidence)]:
             if evidence.file_id not in valid_files or evidence.page > valid_files[evidence.file_id].page_count:
                 raise HTTPException(422, "需求引用了不属于当前任务的来源")
@@ -585,56 +755,74 @@ def update_requirements(job_id: int, data: RequirementsUpdate, db: DB):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     before = snapshot(job)
+    from .agent_work_state import preserve_inputs
+    preserve_inputs(db, job)
     job.requirements = [line.model_dump(mode="json") for line in data.lines]
     job.status = "ready" if data.lines and all(not missing_requirements(line) for line in data.lines) else "needs_review"
     job.revision += 1
     log_change(db, job, "requirements_update", data.reason, before)
+    from .pricing_workflow import queue_changed_job
+    if settings().agent_background:
+        queue_changed_job(db, job)
     db.commit()
     return view_job(db, job, True)
 
 
 @router.post("/jobs/{job_id}/conversation")
 def converse(job_id: int, data: RunInput, db: DB):
-    from .conversation import propose
-    job = job_for(db, job_id)
-    check_revision(job, data.revision)
+    from .collaborative_quotes import collaborate, save_answer
+    job = job_for(db, job_id, True)
     if not data.allow_external_processing:
         raise HTTPException(422, "需授权将需求与报价发送给模型")
     if not data.supplementary_text.strip() or not job.requirements:
         raise HTTPException(422, "请先整理需求并输入问题")
-    quote = db.scalar(select(QuoteDraft).where(QuoteDraft.job_id == job.id).order_by(QuoteDraft.version.desc()).limit(1))
-    requirements, history = job.requirements, job.messages
-    quote_data = view_quote(db, quote, job) if quote else None
+    if job.extraction.get("incomplete"):
+        raise HTTPException(409, "资料仍在整理，请待识别完成后补充报价条件")
+    if job.status == "processing":
+        active = db.scalar(select(AgentRun).where(AgentRun.job_id == job.id, AgentRun.status == "processing"))
+        if not active or not active.usage.get("prepared"):
+            raise HTTPException(409, "正在整理资料，请等待进入报价阶段")
+        if sum(bool(m.get("pending_reply")) for m in job.messages) >= 10:
+            raise HTTPException(409, "待处理补充较多，请等待已发送的消息处理完成")
+        messages = [*job.messages, {"role": "user", "text": data.supplementary_text,
+                                   "at": now().isoformat() + "Z", "reply_id": uuid.uuid4().hex,
+                                   "pending_reply": True}]
+        db.execute(update(RequirementJob).where(RequirementJob.id == job.id).values(messages=messages[-40:]))
+        db.commit()
+        return {"job": view_job(db, job_for(db, job_id), True), "queued": True,
+                "changes": [], "operations": [], "continue_pricing": False}
+    check_revision(job, data.revision)
     db.commit()
     try:
-        answer, usage = propose(requirements, quote_data, history, data.supplementary_text)
+        answer, usage = collaborate(db, job, data.supplementary_text)
     except (ValueError, deepseek.ModelFailure) as exc:
         raise HTTPException(422, "回复未通过校验或模型暂不可用，需求未修改，请重试") from exc
     db.expire_all()
     job = job_for(db, job_id, True)
     check_revision(job, data.revision)
-    messages = [*job.messages,
-                {"role": "user", "text": data.supplementary_text, "at": now().isoformat() + "Z"},
-                {"role": "assistant", "text": answer.answer, "at": now().isoformat() + "Z"}][-40:]
-    # Conversation text is not a pricing revision: do not invalidate approved quotes.
-    db.execute(update(RequirementJob).where(RequirementJob.id == job.id).values(messages=messages))
-    log_change(db, job, "conversation", f"只读报价问答，tokens={usage.get('total_tokens', 0)}")
+    try:
+        result = save_answer(db, job, answer, usage, text=data.supplementary_text)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     db.commit()
     db.expire_all()
-    return {"job": view_job(db, job_for(db, job_id), True),
-            "changes": [change.model_dump() for change in answer.changes]}
+    return {"job": view_job(db, job_for(db, job_id), True), **result}
 
 
 @router.post("/jobs/{job_id}/changes")
 def confirm_changes(job_id: int, data: ConfirmChanges, db: DB):
-    from .conversation import changed_requirements
+    from .collaborative_quotes import validate_changes
     job = job_for(db, job_id, True)
     check_revision(job, data.revision)
     try:
-        lines = changed_requirements(job.requirements, data.changes)
+        if not data.changes and not data.operations:
+            raise ValueError("没有修改内容")
+        lines = validate_changes(db, job, data)
     except ValueError as exc:
         raise HTTPException(422, "修改字段、值或项目编号无效") from exc
     before = snapshot(job)
+    from .agent_work_state import preserve_inputs
+    preserve_inputs(db, job)
     job.requirements = lines
     job.status = "needs_review"
     job.revision += 1
@@ -642,6 +830,9 @@ def confirm_changes(job_id: int, data: ConfirmChanges, db: DB):
                                    "at": now().isoformat() + "Z"}][-40:]
     log_change(db, job, "requirement_patch", "用户逐项确认局部修改：" + "；".join(
         f"{change.line_id}.{change.field}={change.value}" for change in data.changes)[:1800], before)
+    from .pricing_workflow import queue_changed_job
+    if settings().agent_background:
+        queue_changed_job(db, job)
     db.commit()
     return view_job(db, job, True)
 
@@ -666,6 +857,8 @@ def candidates(job_id: int, line_id: str, db: DB, q: str = Query("", max_length=
 def calculate_quote(job_id: int, data: QuoteInput, db: DB):
     job = job_for(db, job_id, True)
     check_revision(job, data.revision)
+    if job.extraction.get("incomplete"):
+        raise HTTPException(409, "资料尚未全部识别，不能把已保存的部分明细作为完整报价")
     if not job.requirements:
         raise HTTPException(422, "请先整理至少一条需求")
     if job.business_rules_version == business_rules.VERSION:
@@ -674,7 +867,8 @@ def calculate_quote(job_id: int, data: QuoteInput, db: DB):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     has_estimates = any(line.get("estimate") for line in job.requirements)
-    payload = build_quote(db, job.requirements, automatic=has_estimates, rounding=data.rounding)
+    payload = build_quote(db, job.requirements, automatic=has_estimates, rounding=data.rounding,
+                          extraction=job.extraction)
     payload.update(customer=job.customer, title=job.title)
     if has_estimates:
         payload["generated_by"] = "agent"
@@ -704,6 +898,10 @@ def approve_quote(quote_id: int, data: ApprovalInput, db: DB):
         raise HTTPException(422, "请确认费用包含/排除范围及报价条款")
     if quote.payload.get("has_estimates") and not data.confirmed_estimates:
         raise HTTPException(422, "请逐项审核并明确确认Agent补全参数、估算费用和报价范围")
+    from .source_reconciliation import source_review
+    if (source_review(job.extraction)["required"] or quote.payload.get("source_review", {}).get("required")
+            ) and not data.confirmed_source_review:
+        raise HTTPException(422, "请核对未读清区域和跨文件归属，并明确确认资料完整性及订购范围")
     if quote.payload.get("generated_by") == "agent" and not data.terms:
         raise HTTPException(422, "Agent 草稿需补充正式费用范围及有效期条款后批准")
     before = snapshot(quote)
@@ -714,6 +912,8 @@ def approve_quote(quote_id: int, data: ApprovalInput, db: DB):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     quote.status, quote.approval_note, quote.approved_at = "approved", data.note, now()
+    if data.confirmed_source_review:
+        quote.payload = {**quote.payload, "source_review_confirmed": True}
     log_change(db, quote, "approve", data.note, before)
     db.commit()
     return view_quote(db, quote, job)
@@ -738,15 +938,16 @@ def export_quote(quote_id: int, db: DB, audience: Literal["customer", "review"] 
     writer.writerow(["项目", csv_safe(quote.payload["title"]), "客户", csv_safe(quote.payload["customer"])])
     writer.writerow(["用途", "内部审核版（不可作为正式报价）" if audience == "review" else "客户报价",
                      "规则版本", csv_safe(quote.payload.get("business_rules", {}).get("version", "legacy"))])
-    writer.writerow(["产品", "文字内容", "材质", "规格(mm)", "数量", "金额(CNY)", "类型备注", "工艺难度备注"])
+    writer.writerow(["产品", "文字内容", "材质", "规格(mm)", "数量", "金额(CNY)", "类型备注", "工艺难度备注", "计量单位"])
     for line in quote.payload["lines"]:
         requirement = line.get("effective_requirement", line["requirement"])
         writer.writerow([csv_safe(line["product"]), csv_safe(requirement["text_content"]),
                          csv_safe(requirement["material"]),
                          f'{requirement["width_mm"] or ""} x {requirement["height_mm"] or ""}',
-                         requirement["quantity"], line["amount"], csv_safe(requirement.get("type_note")),
+                         line.get("billing_quantity", requirement["quantity"]), line["amount"], csv_safe(requirement.get("type_note")),
                          csv_safe(requirement.get("difficulty_note") or
-                                  (requirement.get("difficulty") if requirement.get("difficulty") != "unknown" else "未标注"))])
+                                  (requirement.get("difficulty") if requirement.get("difficulty") != "unknown" else "未标注")),
+                         csv_safe(line.get("billing_unit") or requirement.get("quantity_unit") or "件")])
         if audience == "review":
             import json
             writer.writerow(["计价过程", csv_safe(line.get("formula")), "单价依据", csv_safe(line.get("unit_formula"))])

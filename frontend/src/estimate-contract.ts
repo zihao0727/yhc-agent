@@ -2,14 +2,14 @@ import type { EstimatePlan, Line, PricingTarget } from './requirements-types'
 
 export function targetOptions(line?: Line) {
   return [
-    { value: 'item:', label: '整件', target: 'item' as PricingTarget, index: null },
+    { value: 'item:', label: '整件', target: 'item' as PricingTarget, index: null, object_id: null },
     ...(line?.letter_groups || []).map((group, index) => ({
       value: `letter_group:${index}`, label: `字组 ${index + 1} · ${group.label || '未命名'}`,
-      target: 'letter_group' as PricingTarget, index,
+      target: 'letter_group' as PricingTarget, index, object_id: group.object_id || null,
     })),
     ...(line?.components || []).map((component, index) => ({
       value: `component:${index}`, label: `部件 ${index + 1} · ${component.name || '未命名'}`,
-      target: 'component' as PricingTarget, index,
+      target: 'component' as PricingTarget, index, object_id: component.object_id || null,
     })),
   ]
 }
@@ -41,8 +41,11 @@ export function removeEstimateCost(plan: EstimatePlan, index: number): boolean {
 
 export function removePricingTarget(line: Line, target: Exclude<PricingTarget, 'item'>, index: number): boolean {
   const references = [...(line.estimate?.assumptions || []), ...(line.estimate?.costs || [])]
-  if (references.some(item => item.target === target && item.target_index === index)) return false
   const collection = target === 'letter_group' ? line.letter_groups : line.components
+  if (references.some(item => item.target === target && (item.target_index === index
+    || item.target_id && item.target_id === collection?.[index]?.object_id))) return false
+  if (target === 'component' && line.estimate?.costs.some(cost =>
+    cost.covers_component_ids?.includes(collection?.[index]?.object_id || ''))) return false
   collection?.splice(index, 1)
   references.forEach(item => {
     if (item.target === target && item.target_index != null && item.target_index > index) item.target_index--

@@ -49,6 +49,22 @@ def test_compatible_object_arguments_are_serialized_without_guessing():
     assert json.loads(normalized["tool_calls"][0]["function"]["arguments"]) == original
 
 
+def test_invalid_json_diagnostics_locate_tool_and_offset_without_recording_values():
+    arguments = '{"private_customer_data":"DO_NOT_LOG","observations":'
+    message = call("save_observations")
+    message["tool_calls"][0]["function"]["arguments"] = arguments
+    with pytest.raises(deepseek.AgentResponseFailure) as error:
+        deepseek.parse_agent_response(envelope(message))
+    diagnostics = error.value.diagnostics
+    assert diagnostics["tool_name"] == "save_observations"
+    assert diagnostics["call_index"] == 0
+    assert diagnostics["argument_chars"] == len(arguments)
+    assert diagnostics["json_error_position"] == len(arguments)
+    assert diagnostics["json_error_line"] == 1
+    assert "DO_NOT_LOG" not in json.dumps(diagnostics)
+    assert "private_customer_data" not in json.dumps(diagnostics)
+
+
 def test_wire_truncation_is_recoverable_but_http_auth_failure_is_not(monkeypatch):
     configure_transport(monkeypatch, lambda request: httpx.Response(200, json=envelope(finish_reason="length")))
     with pytest.raises(deepseek.AgentResponseFailure) as exc:

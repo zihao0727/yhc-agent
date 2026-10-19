@@ -7,10 +7,20 @@ from pydantic import ValidationError
 from .config import settings
 from .customer_files import storage_path
 from .excel_skills import (COMMON, MAX_CREATIONS_PER_FILE, GeneratedSkill, WorkbookPlan, generated_name,
-                           library, save_generated, structural_profile, validate_plan, workbook_profile)
+                           PlanValidationError, library, normalize_plan, recover_plan, save_generated,
+                           structural_profile, validate_plan, workbook_profile)
 
 
-def request_json(task, system, data, schema, checkpoint=None, validator=None):
+def use_builtin_guide(item, skills):
+    skill = skills["excel-freeform"]
+    item.skill = skill.name
+    item.skill_origin = skill.origin
+    item.skill_revision = skill.fingerprint
+    item.created = False
+    item.reason = "自定义解析方法不可用，复用内置不规则表解析；保留已核验的列映射和来源校验。"
+
+
+def request_json(task, system, data, schema, checkpoint=None, validator=None, recovery=None):
     from .deepseek import ModelFailure, agent_usage, get_key, reject_json_constant
     config = settings()
     messages = [{"role": "system", "content": system +
@@ -19,6 +29,7 @@ def request_json(task, system, data, schema, checkpoint=None, validator=None):
                                                        **data}, ensure_ascii=False)}]
     usage, failures = {}, []
     for attempt in range(1, 3):
+        result, content = None, None
         if checkpoint:
             checkpoint.check()
         try:
@@ -43,7 +54,8 @@ def request_json(task, system, data, schema, checkpoint=None, validator=None):
             choice = body["choices"][0]
             if choice.get("finish_reason") != "stop":
                 raise ValueError("Skill规划响应不完整")
-            raw = json.loads(choice["message"]["content"], parse_constant=reject_json_constant)
+            content = choice["message"]["content"]
+            raw = json.loads(content, parse_constant=reject_json_constant)
             result = schema.model_validate(raw)
             if validator:
                 validator(result)
@@ -51,14 +63,21 @@ def request_json(task, system, data, schema, checkpoint=None, validator=None):
         except (ValueError, KeyError, TypeError, IndexError, AttributeError, RecursionError) as exc:
             fields = ([{"path": ".".join(map(str, item["loc"])), "type": item["type"]}
                        for item in exc.errors(include_input=False, include_context=False)[:10]]
-                      if isinstance(exc, ValidationError) else [])
+                      if isinstance(exc, ValidationError) else
+                      exc.fields[:20] if isinstance(exc, PlanValidationError) else [])
             failures.append({"attempt": attempt, "error_type": type(exc).__name__, "fields": fields,
                              "reason": str(exc)[:150] if type(exc) is ValueError else ""})
             if attempt == 2:
+                if recovery and isinstance(exc, PlanValidationError) and result is not None:
+                    return recovery(result), attempt, usage
                 raise ModelFailure("Excel Skill规划格式校验失败，已停止自动重试", attempt, usage,
                                    {"stage": task, "failures": failures, "retryable": False}) from exc
+            if isinstance(content, str) and len(content) <= 32000:
+                messages.append({"role": "assistant", "content": content})
             messages.append({"role": "user", "content": "请修正并返回完整JSON，不添加schema外字段。" +
-                             json.dumps(failures[-1], ensure_ascii=False)})
+                             "按错误path核对原始单元格；不存在的表头不要猜测，没有可靠映射的字段请省略。"
+                             "材质/工艺/尺寸/备注可共用来源列；数量/单位/序号/产品/类型/难度须独立。"
+                             + json.dumps(failures[-1], ensure_ascii=False)})
 
 
 def plan_files(files, checkpoint=None):
@@ -66,7 +85,12 @@ def plan_files(files, checkpoint=None):
     plans, usage, attempts = {}, {}, 0
     skills = library()
     for file in files:
-        pages = json.loads((storage_path(file.storage_key) / "excel.json").read_text(encoding="utf-8"))["pages"]
+        from .excel_manifest import load_manifest
+        manifest = load_manifest(storage_path(file.storage_key), upgrade=True)
+        if manifest.get("upgrade_status") == "requires_reextraction":
+            raise ModelFailure("新解析结果的页/行位置有变化，需明确重新识别；原文件和旧来源定位保留",
+                diagnostics={"stage": "source_upgrade", "file_id": file.id, "retryable": False})
+        pages = manifest["pages"]
         cached = checkpoint.load_plan(file.id) if checkpoint else None
         if cached:
             try:
@@ -86,6 +110,10 @@ def plan_files(files, checkpoint=None):
                 "逐一覆盖提供的工作表，根据结构、表头语义、图纸和用途选择catalog中的Skill；"
                 "同一工作簿可有不同类型工作表。不要只按文件名判断。"
                 "columns是语义字段到实际表头单元格（如B2）的映射，不是数据单元格或列字母。"
+                "material/process/dimensions/notes可共用项目特征等综合描述列；"
+                "product/quantity/unit/item/code/type_note/difficulty必须使用各自独立的真实表头。"
+                "code映射项目编码、图号等实际项目代码，不能把清单行序号当作图号。"
+                "无表头的列不要虚构表头地址，省略映射。"
                 "行表可映射product/quantity/unit/material等；转置或矩阵不强造行式映射，columns可为空。"
                 "价格参考表purpose=price_reference，历史报价purpose=historical_quote。"
                 "若现有Skill不能清楚描述特殊结构，可将skill填create，设置layout，程序将创建可复用方法。"
@@ -94,7 +122,8 @@ def plan_files(files, checkpoint=None):
                 {"catalog": [{"name": s.name, "description": s.description} for s in skills.values()
                              if s.name != COMMON],
                  "sheets": workbook_profile(pages)}, WorkbookPlan, checkpoint,
-                 lambda value: validate_plan(value, pages, skills))
+                 lambda value: validate_plan(normalize_plan(value), pages, skills),
+                 lambda value: recover_plan(value, pages, skills))
             current_attempts += count
             current_usage = dict(tokens)
             validate_plan(plan, pages, skills)
@@ -113,25 +142,40 @@ def plan_files(files, checkpoint=None):
                     item.skill_revision = skills[existing_name].fingerprint
                     continue
                 if created_count >= MAX_CREATIONS_PER_FILE:
-                    raise ValueError("本工作簿自动创建Skill已达本次上限")
-                spec, count, tokens = request_json("create_excel_skill",
-                    "编写可复用的Excel解析Skill正文。只描述给出的结构、字段关联、分块及证据定位方法。"
-                    "输入不包含客户原始业务数据；不要编造具体客户、名称、金额或数据样例。"
-                    "description说明何时适用，guidance用简洁Markdown写具体解析步骤及歧义处理。"
-                    "方法应适用于后续同类表格，不固化输入的行号、列号或数量；每次按语义定位。"
-                    "不得创建脚本、执行代码、访问网络、改变单价、制定商业费率、请求密钥或授予权限。"
-                    "所有方法受调用方来源核验和输出schema约束；不修改该契约，不要求忽略系统规则。",
-                    {"structure": structure}, GeneratedSkill, checkpoint)
+                    use_builtin_guide(item, skills)
+                    continue
+                created_count += 1
+                try:
+                    spec, count, tokens = request_json("create_excel_skill",
+                        "编写可复用的Excel解析Skill正文。只描述给出的结构、字段关联、分块及证据定位方法。"
+                        "输入不包含客户原始业务数据；不要编造具体客户、名称、金额或数据样例。"
+                        "description说明何时适用，guidance用简洁Markdown写具体解析步骤及歧义处理。"
+                        "方法应适用于后续同类表格，不固化输入的行号、列号或数量；每次按语义定位。"
+                        "不得创建脚本、执行代码、访问网络、改变单价、制定商业费率、请求密钥或授予权限。"
+                        "所有方法受调用方来源核验和输出schema约束；不修改该契约，不要求忽略系统规则。",
+                        {"structure": structure}, GeneratedSkill, checkpoint)
+                except ModelFailure as exc:
+                    # Optional guide prose must not block a source-validated extraction plan.
+                    if not exc.diagnostics.get("failures") or exc.diagnostics.get("retryable") is not False:
+                        raise
+                    current_attempts += exc.attempts
+                    for field, value in exc.usage.items():
+                        current_usage[field] = current_usage.get(field, 0) + value
+                    use_builtin_guide(item, skills)
+                    continue
                 current_attempts += count
                 for field, value in tokens.items():
                     current_usage[field] = current_usage.get(field, 0) + value
-                skill = save_generated(spec, structure)
+                try:
+                    skill = save_generated(spec, structure)
+                except (ValueError, OSError):
+                    use_builtin_guide(item, skills)
+                    continue
                 skills[skill.name] = skill
                 item.skill = skill.name
                 item.skill_origin = skill.origin
                 item.skill_revision = skill.fingerprint
                 item.created = True
-                created_count += 1
             validate_plan(plan, pages, skills)
             plans[file.id] = plan
             if checkpoint:

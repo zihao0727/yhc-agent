@@ -1,0 +1,57 @@
+name: Quotation Regression
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: quotation_test
+          POSTGRES_PASSWORD: local-test-only
+          POSTGRES_DB: quotation_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U quotation_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://quotation_test:local-test-only@127.0.0.1:5432/quotation_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      REDIS_PREFIX: quotation-ci
+      ADMIN_TOKEN: ci-local-test-token
+      AGENT_BACKGROUND: "false"
+      DEEPSEEK_API_KEY: ""
+      SILICONFLOW_API_KEY: ""
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: pip install -r requirements.lock
+        working-directory: backend
+      - run: python -m alembic upgrade head
+        working-directory: backend
+      - run: python -m scripts.export_quote_contract --check
+        working-directory: backend
+      - run: python -m pytest -q --disable-warnings
+        working-directory: backend
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

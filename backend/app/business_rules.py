@@ -56,6 +56,10 @@ def letter_measure(line, unit):
         return value
     if line.character_count is None:
         raise ValueError("字类缺少每件字数/字母数，成品数量不能替代字数")
+    if line.measurement_version >= 3 and line.character_count != 1:
+        from .pricing_errors import PricingError
+        raise PricingError("ambiguous_letter_dimensions", "多字项目缺少字组尺寸，不能将整件尺寸按字数放大",
+                           ["letter_groups"], cause="recognition_review", action="inspect_source")
     if unit == "cm":
         if line.billing_length_mm is None:
             raise ValueError("字类缺少单字计价长度")
@@ -73,6 +77,10 @@ def power_units(line):
         return Decimal(line.power_count)
     groups = line.letter_groups
     if not groups:
+        if line.measurement_version >= 3 and line.character_count != 1:
+            from .pricing_errors import PricingError
+            raise PricingError("ambiguous_letter_dimensions", "逐字电源须按字组面积核算，不能使用整件面积",
+                               ["letter_groups"], cause="recognition_review", action="inspect_source")
         if line.character_count is None or area(line) is None:
             raise ValueError("逐字电源计算需要明确的单字面积和字数")
         count = (area(line) / 3).to_integral_value(rounding=ROUND_CEILING) * line.character_count

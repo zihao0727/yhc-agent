@@ -9,7 +9,15 @@ def review_signals(lines):
     for line in lines:
         signals = []
         effective = line.get("effective_requirement", line["requirement"])
+        if (effective.get("pricing_family") == "letter" and not effective.get("letter_groups")
+                and (effective.get("character_count") or 0) > 1
+                and effective.get("measurement_version", 2) < 3):
+            signals.append({"code": "legacy_letter_scope", "cost_index": -1,
+                            "message": "旧版多字方案未区分整件与单字尺寸，存在重复乘字数风险，须按新契约核对"})
         for index, cost in enumerate(line.get("estimate_costs", [])):
+            if cost.get("script_run"):
+                signals.append({"code": "custom_measurement", "cost_index": index,
+                                "message": f'{cost["label"]}使用临时计算，须核实单位换算、几何假设和规则适用；脚本已随输入重算'})
             if cost["source"] == "agent_estimate" and cost.get("rate_basis_amount") is None:
                 signals.append({"code": "unverified_rate", "cost_index": index,
                                 "message": f'{cost["label"]}为自主估价，单价尚无结构化数值依据，须人工核价'})

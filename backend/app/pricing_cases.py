@@ -3,6 +3,7 @@ import ast
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import operator
+import re
 
 from sqlalchemy import select
 
@@ -118,3 +119,58 @@ def case_references(db, line):
             if len(results) == 3:
                 break
     return results
+
+
+def source_price_columns(source):
+    from openpyxl.utils.cell import coordinate_to_tuple
+    aliases = {"unit_price": {"单价", "综合单价", "报价单价", "unitprice"},
+               "amount": {"金额", "合价", "总价", "total", "amount"},
+               "remarks": {"备注", "说明", "remarks"}}
+    columns = {}
+    for row in source.get("header_rows", []):
+        for cell in row["cells"]:
+            text = re.sub(r"\s+", "", cell["value"]).casefold()
+            for kind, names in aliases.items():
+                if text in names:
+                    columns[kind] = coordinate_to_tuple(cell["cell"])[1]
+    return columns
+
+
+def uploaded_price_references(db, job, raw, *, pages=None):
+    """Expose human formulas as unapproved references, never source cost facts."""
+    from openpyxl.utils.cell import coordinate_to_tuple
+    from .customer_excel import MEDIA_TYPE, page_source
+    from .customer_files import storage_path
+    from .models import CustomerFile
+    locations = {(e["file_id"], e["page"], coordinate_to_tuple(e["cell"])[0])
+                 for e in raw.get("evidence", []) if e.get("cell") and e.get("source", "text") == "text"}
+    pages = {} if pages is None else pages
+    results = []
+    for file_id, page_number, row_number in sorted(locations):
+        file = db.get(CustomerFile, file_id)
+        if not file or file.job_id != job.id or file.media_type != MEDIA_TYPE or page_number > file.page_count:
+            continue
+        key = (file_id, page_number)
+        if key not in pages:
+            pages[key] = page_source(storage_path(file.storage_key), page_number)
+        page = pages[key]
+        columns = source_price_columns(page)
+        cells = {coordinate_to_tuple(cell["cell"])[1]: cell for row in page["rows"]
+                 if row["row"] == row_number for cell in row["cells"]}
+        price = cells.get(columns.get("unit_price"))
+        if not price or not (price.get("value") or price.get("formula")):
+            continue
+        formula = price.get("formula", "")
+        calculated, issue = None, ""
+        try:
+            calculated = str(arithmetic_formula(formula)) if formula else str(Decimal(price["value"]))
+            if not Decimal(calculated).is_finite() or Decimal(calculated) <= 0:
+                calculated, issue = None, "参考价格不是有效正数，须核实"
+        except (ValueError, ArithmeticError):
+            issue = "原公式包含引用或未核实参数，不自动执行或把缺项当零"
+        results.append({"file_id": file_id, "page": page_number, "sheet": page["sheet"],
+                        "cell": price["cell"], "formula": formula, "cached_value": price.get("value", ""),
+                        "calculated_value": calculated, "remarks": cells.get(columns.get("remarks"), {}).get("value", ""),
+                        "reference_only": True, "reviewed": False, "issue": issue,
+                        "notice": "客户原表人工价格，仅参考；须确认综合费率、固定费、费用排除及生产做法，不能当供应商成本或已批准报价。"})
+    return results[:5]

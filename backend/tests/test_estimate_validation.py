@@ -108,12 +108,12 @@ def test_catalog_suggested_price_cannot_be_multiplied_again(
                          reference_id=price["id"], reference_revision=price["revision"],
                          expected_amount=None, quantity_formula=formula)
     quote = calculate(test_db, letter([cost], pricing_family="material",
-                                      width_mm="689", height_mm="1012"))
+                                      material="铝", thickness_mm="3", width_mm="689", height_mm="1012"))
     assert quote["total"] is None
     assert "额外倍数" in quote["lines"][0]["blockers"][0]
     cost["quantity_formula"] = "=area_m2"
     correct = calculate(test_db, letter([cost], pricing_family="material",
-                                       width_mm="689", height_mm="1012"))
+                                       material="铝", thickness_mm="3", width_mm="689", height_mm="1012"))
     assert correct["total"] == "1045.90"
 
 
@@ -122,9 +122,9 @@ def test_authoritative_catalog_unit_cannot_be_relabeled(client, price_input, tes
     cost = estimate_cost(source="catalog", rate="8.5", rate_unit="m2",
                          reference_id=price["id"], reference_revision=price["revision"],
                          quantity_formula="=letter_cm", expected_amount=None)
-    assert calculate(test_db, letter([cost]))["total"] is None
+    assert calculate(test_db, letter([cost], material="铝", thickness_mm="3"))["total"] is None
     cost["rate_unit"] = "unknown"
-    quote = calculate(test_db, letter([cost]))
+    quote = calculate(test_db, letter([cost], material="铝", thickness_mm="3"))
     assert quote["total"] == "212.50"
     assert quote["lines"][0]["estimate_costs"][0]["rate_unit"] == "cm"
 

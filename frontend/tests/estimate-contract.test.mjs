@@ -32,3 +32,20 @@ test('deleting objects cannot silently redirect existing fees to another compone
   assert.equal(line.estimate.costs[0].target_index, 0)
   assert.equal(line.dimension_evidence[0].target_index, 0)
 })
+
+test('stable object references prevent deleting a referenced component without an index', () => {
+  const line = { components: [{ name: 'A', object_id: 'a' }, { name: 'B', object_id: 'b' }],
+    estimate: { assumptions: [], costs: [{ target: 'component', target_id: 'b' }] } }
+  assert.equal(removePricingTarget(line, 'component', 1), false)
+  assert(removePricingTarget(line, 'component', 0))
+  assert.equal(line.estimate.costs[0].target_id, 'b')
+  assert.equal(targetOptions(line)[1].object_id, 'b')
+})
+
+test('finished assembly coverage prevents deleting a covered component', () => {
+  const line = { components: [{ name: 'Front', object_id: 'front' }, { name: 'Back', object_id: 'back' }],
+    estimate: { assumptions: [], costs: [{ target: 'item', covers_component_ids: ['front'] }] } }
+  assert.equal(removePricingTarget(line, 'component', 0), false)
+  assert(removePricingTarget(line, 'component', 1))
+  assert.equal(line.components.length, 1)
+})

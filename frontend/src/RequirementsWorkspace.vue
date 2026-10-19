@@ -1,24 +1,30 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, ArrowRight, Check, ChevronLeft, ChevronRight, Download, FileImage, FileText, KeyRound, Link, Pencil, Plus, RefreshCw, Save, Search, Sparkles, Table2, Trash2, Upload, X, ZoomIn, ZoomOut } from 'lucide-vue-next'
+import { ArrowRight, Check, ChevronLeft, ChevronRight, FileImage, FileText, KeyRound, Link, Pencil, Plus, RefreshCw, Save, Search, Sparkles, Table2, Trash2, Upload, X, ZoomIn, ZoomOut } from 'lucide-vue-next'
 import { api, apiBlob, languageLabels, statusLabels, unitLabels, type Price, type Rule } from './api'
-import { businessRuleVersion, businessTerms, costKinds, includedCostKinds, jobLabels, quoteDisplayTotal, type CustomerFile, type Job, type JobProgress, type Line, type Quote } from './requirements-types'
+import { businessRuleVersion, businessTerms, costKinds, includedCostKinds, jobLabels, type CustomerFile, type Job, type JobProgress, type Line, type Quote } from './requirements-types'
 import BusinessFields from './BusinessFields.vue'
 import QuantitySources from './QuantitySources.vue'
 import QuoteChat from './QuoteChat.vue'
-import QuotePricingDetails from './QuotePricingDetails.vue'
-import QuoteConfirmations from './QuoteConfirmations.vue'
-import EstimateReviewList from './EstimateReviewList.vue'
+import QuoteResults from './QuoteResults.vue'
+import QuoteSupplement from './QuoteSupplement.vue'
 import EstimateEditor from './EstimateEditor.vue'
-import QuoteVersionDiff from './QuoteVersionDiff.vue'
-import AgentStepDetails from './AgentStepDetails.vue'
+import PipelineAudit from './PipelineAudit.vue'
 import { shouldResumeConversation } from './agent-intent'
+import { attachmentAccept, uploadLimits, validateAttachments } from './upload-limits'
+import { applySupplementEdits, pendingRows, type SupplementEdit } from './quote-workspace'
 
 const chat = ref<InstanceType<typeof QuoteChat>>()
+const supplementPanel = ref<InstanceType<typeof QuoteSupplement>>()
+const workspaceView = ref<'results' | 'supplement' | 'conversation'>('conversation')
 const detailsOpen = ref(false)
-type ProposedChange = { line_id: string; field: keyof Line; value: string | null; reason: string }
-const proposal = ref<{ jobId: number; revision: number; changes: ProposedChange[] } | null>(null)
+type ProposedChange = { line_id: string; field: keyof Line; value: string | null; reason: string;
+  target?: string; target_id?: string | null }
+type QuoteOperation = { kind: 'add' | 'remove' | 'estimate' | 'extras'; line_id: string; reason: string;
+  new_line?: Partial<Line>; estimate?: Line['estimate']; extras?: Line['extras'] }
+const operationLabels = { add: '新增项目', remove: '删除项目', estimate: '修改计价方案', extras: '修改附加费' }
+const proposal = ref<{ jobId: number; revision: number; changes: ProposedChange[]; operations: QuoteOperation[]; resumeAfter?: boolean } | null>(null)
 const proposalOpen = ref(false)
 const fieldLabels: Record<string, string> = {
   quantity: '数量', width_mm: '宽度 (mm)', height_mm: '高度 (mm)', depth_mm: '深度 (mm)',
@@ -54,19 +60,8 @@ const replace = ref(false)
 const agentMode = ref(false)
 const requestIntent = ref<'auto' | 'resume' | 'extract'>('auto')
 const autoRun = ref(false)
-const latestAgent = computed(() => job.value?.agent_runs?.[0])
-const agentStatus: Record<string, string> = { processing: '执行中', succeeded: '已生成草稿', waiting: '有未解决事项', failed: '执行失败', cancelled: '已停止', limited: '已达上限' }
-const toolLabels: Record<string, string> = { context_compact: '压缩记录并自动继续', extract_requirements: '整理需求', search_prices: '查询报价库', evaluate_price: '判断适用性', select_price: '关联单价', calculate_quote: '检查计价', finish_quote: '生成报价', ask_user: '请求补充' }
 const lineOpen = ref(false)
-Object.assign(toolLabels, { response_recovery: '响应异常，自动恢复', complete_estimate: '生成补全审核方案' })
-Object.assign(toolLabels, { extract_requirements_failed: '需求识别失败，已保留原数据' })
-Object.assign(toolLabels, { progress_notice: '进度提醒，AI继续判断', execution_limit: '达到调用保护上限' })
-Object.assign(toolLabels, { defer_requirement: '记录问题并继续其他项目' })
-Object.assign(toolLabels, { search_prices_semantic: '语义检索报价候选' })
 const editingLine = ref<Line | null>(null)
-const reviewOpen = ref(false)
-const reviewLines = computed(() => job.value?.quotes[0]?.payload.lines.filter(line => line.amount === null) || [])
-const reviewWarnings = computed(() => job.value?.quotes[0]?.payload.lines.filter(line => line.warnings?.length) || [])
 const pricingProducts = ref<{ id: number; name: string }[]>([])
 const reason = ref('')
 const candidateOpen = ref(false)
@@ -81,12 +76,12 @@ const quoteRounding = ref('none')
 const currentPolicy = computed(() => job.value?.business_rules_version === businessRuleVersion)
 const selectedQuoteId = ref<number | null>(null)
 const selectedQuote = computed(() => job.value?.quotes.find(q => q.id === selectedQuoteId.value) || job.value?.quotes[0])
-const previousQuote = computed(() => job.value?.quotes.find(quote => quote.version < (selectedQuote.value?.version || 0)))
 const approvalOpen = ref(false)
 const approvalNote = ref('')
 const approvalTerms = ref('')
 const commercialConfirmed = ref(false)
 const estimatesConfirmed = ref(false)
+const sourcesConfirmed = ref(false)
 const previewOpen = ref(false)
 const previewFile = ref<CustomerFile | null>(null)
 const previewPage = ref(1)
@@ -99,10 +94,13 @@ type ExcelSource = { sheet: string; row_start: number; row_end: number; notice: 
 const previewSource = ref<ExcelSource | null>(null)
 const isExcel = (file: CustomerFile) => file.media_type.includes('spreadsheetml')
 const detailTab = ref('requirements')
+const requirementPage = ref(1)
+const visibleRequirements = computed(() => job.value?.requirements.slice((requirementPage.value - 1) * 50, requirementPage.value * 50) || [])
 let previewSequence = 0
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let disposed = false
 let polling = false
+let lastIdlePoll = 0
 let navigationSequence = 0
 let listSequence = 0
 let pollController: AbortController | undefined
@@ -111,8 +109,23 @@ function invalidateRequests() {
   pollController?.abort()
 }
 function discardProposal() { proposal.value = null; proposalOpen.value = false }
+function proposalTarget(change: ProposedChange) {
+  const line = job.value?.requirements.find(line => line.id === change.line_id)
+  if (!line) return { name: '项目', original: null }
+  const objects = change.target === 'component'
+    ? [...(line.components || []), ...(line.estimate?.proposed_components || [])]
+    : [...(line.letter_groups || []), ...(line.estimate?.proposed_letter_groups || [])]
+  const target = change.target && change.target !== 'item'
+    ? objects.find(object => object.object_id === change.target_id) : line
+  return { name: `${line.source_item ? `#${line.source_item} ` : ''}${line.product}${target && target !== line ? ` · ${'name' in target ? target.name : 'label' in target ? target.label : ''}` : ''}`,
+    original: target ? (target as unknown as Record<string, unknown>)[change.field] : null }
+}
 async function pollProgress() {
-  if (polling || busy.value || !job.value || job.value.status !== 'processing' || disposed) return
+  if (polling || busy.value || !job.value || disposed) return
+  if (job.value.status !== 'processing') {
+    if (!job.value.quote_workspace?.actions.auto_resume || Date.now() - lastIdlePoll < 15000) return
+    lastIdlePoll = Date.now()
+  }
   polling = true
   const id = job.value.id
   const sequence = navigationSequence
@@ -124,7 +137,21 @@ async function pollProgress() {
       { signal: controller.signal })
     if (disposed || sequence !== navigationSequence || job.value?.id !== id || busy.value) return
     if (progress.revision < job.value.revision) return
-    if (progress.status !== 'processing') {
+    if (progress.messages) job.value.messages = progress.messages
+    if (progress.revision > job.value.revision && (progress.run?.usage.prepared
+        || progress.run?.usage.extraction_progress?.extraction_route === 'source_agent')) {
+      const current = await api<Job>(`/jobs/${id}`, { signal: controller.signal })
+      if (!disposed && sequence === navigationSequence && job.value?.id === id && !busy.value) job.value = current
+      return
+    }
+    if (progress.status !== 'processing' && progress.status === job.value.status
+      && progress.revision === job.value.revision && progress.run?.id === job.value.agent_runs[0]?.id
+      && progress.run?.step_count === job.value.agent_runs[0]?.steps.length) {
+      job.value.quote_workspace = progress.quote_workspace
+      job.value.pricing_progress = progress.pricing_progress
+      return
+    }
+    if (progress.status !== 'processing' || job.value.status !== 'processing') {
       const current = await api<Job>(`/jobs/${id}`, { signal: controller.signal })
       if (!disposed && sequence === navigationSequence && job.value?.id === id && !busy.value) {
         job.value = current
@@ -134,11 +161,21 @@ async function pollProgress() {
     }
     // Keep the complete document revision until a full reload; only progress is incremental.
     job.value.pricing_progress = progress.pricing_progress
+    job.value.quote_workspace = progress.quote_workspace
     if (progress.run) {
       const incoming = progress.run
       const previous = job.value.agent_runs.find(item => item.id === incoming.id)
       const merged = { ...incoming, steps: [...(previous?.steps.slice(0, incoming.offset) || []), ...incoming.steps] }
       job.value.agent_runs = [merged, ...job.value.agent_runs.filter(item => item.id !== incoming.id)]
+      const savedLines = incoming.usage.extraction_progress?.saved_lines || 0
+      if (savedLines > job.value.requirements.length) {
+        const rows = await api<{ lines: Line[]; total: number }>(`/jobs/${id}/requirements-page?offset=${job.value.requirements.length}&limit=100`,
+          { signal: controller.signal })
+        if (disposed || sequence !== navigationSequence || job.value?.id !== id || busy.value) return
+        job.value.requirements.push(...rows.lines)
+        job.value.line_count = rows.total
+        job.value.extraction.incomplete = true
+      }
     }
     error.value = ''
   } catch (e) {
@@ -164,6 +201,7 @@ async function refresh() {
   const sequence = navigationSequence
   try {
     config.value = await api('/model-config')
+    Object.assign(uploadLimits, await api('/upload-config'))
     embeddingConfig.value = { ...embeddingConfig.value, ...await api<typeof embeddingConfig.value>('/embedding-config') }
     pricingProducts.value = (await api<{ products: typeof pricingProducts.value }>('/options')).products
     if (id) {
@@ -181,34 +219,44 @@ async function refreshList() {
   jobs.value = result.items; total.value = result.total
 }
 function openDetails(tab: string) {
-  if (tab === 'review') { reviewOpen.value = true; return }
+  if (tab === 'review') { workspaceView.value = 'supplement'; detailsOpen.value = false; return }
+  if (tab === 'quotes') { workspaceView.value = 'results'; detailsOpen.value = false; return }
   detailTab.value = tab; detailsOpen.value = true
 }
-function newConversation() { invalidateRequests(); discardProposal(); job.value = null; error.value = ''; detailsOpen.value = false; reviewOpen.value = false; selectedQuoteId.value = null }
-async function sendChat(payload: { text: string; files: File[] }) {
-  if (busy.value || job.value?.status === 'processing') return
+function newConversation() { invalidateRequests(); discardProposal(); job.value = null; error.value = ''; detailsOpen.value = false; workspaceView.value = 'conversation'; selectedQuoteId.value = null }
+async function sendChat(payload: { text: string; files: File[] }, options: { autoContinue?: boolean; onFilesAccepted?: () => void } = {}) {
+  if (busy.value) return false
+  if (job.value?.status === 'processing' && (!payload.text.trim() || payload.files.length)) return false
   invalidateRequests()
   discardProposal()
   busy.value = true; error.value = ''
   try {
     const initial = !job.value
-    const resume = !initial && shouldResumeConversation(
+    const resume = !initial && job.value?.status !== 'processing' && shouldResumeConversation(
       payload.text, payload.files.length, Boolean(job.value?.requirements.length))
     if (!initial && !resume && !payload.files.length && job.value?.requirements.length) {
       const current = job.value
-      const response = await api<{ job: Job; changes: ProposedChange[] }>(`/jobs/${current.id}/conversation`, {
+      const response = await api<{ job: Job; changes: ProposedChange[]; operations?: QuoteOperation[];
+        applied?: boolean; queued?: boolean; continue_pricing?: boolean }>(`/jobs/${current.id}/conversation`, {
         method: 'POST', body: JSON.stringify({ revision: current.revision,
           supplementary_text: payload.text, allow_external_processing: true }),
       })
       job.value = response.job
       chat.value?.clearComposer()
       discardProposal()
-      if (response.changes.length) {
-        proposal.value = { jobId: current.id, revision: response.job.revision, changes: response.changes }
+      if (response.changes.length || response.operations?.length) {
+        proposal.value = { jobId: current.id, revision: response.job.revision, changes: response.changes,
+          operations: response.operations || [], resumeAfter: options.autoContinue === true }
         proposalOpen.value = true
       }
+      if (response.queued) ElMessage.info('补充已收到，将在当前步骤完成后处理')
+      if (response.continue_pricing && !proposal.value && options.autoContinue !== false && response.job.status !== 'processing') {
+        agentMode.value = true; consent.value = true; replace.value = false
+        requestIntent.value = 'resume'; supplementary.value = ''
+        await extract()
+      }
       await refreshList()
-      return
+      return true
     }
     if (initial) {
       const form = new FormData()
@@ -221,24 +269,29 @@ async function sendChat(payload: { text: string; files: File[] }) {
         try {
           await ElMessageBox.confirm('新增附件将重新整理整单需求，原有价格关联会被清除，旧报价将失效。是否继续？', '重新识别资料',
             { confirmButtonText: '确认重新识别', cancelButtonText: '取消', type: 'warning' })
-        } catch { return }
+        } catch { return false }
       }
       const form = new FormData()
       form.append('revision', String(job.value.revision))
       payload.files.forEach(file => form.append('files', file))
       job.value = await api<Job>(`/jobs/${job.value.id}/files`, { method: 'POST', body: form })
+      options.onFilesAccepted?.()
     }
     // Clear accepted attachments before running so retries cannot upload duplicates.
     chat.value?.clearComposer()
+    if (options.autoContinue === false) { await refreshList(); return true }
     agentMode.value = true; consent.value = true; replace.value = !resume
     requestIntent.value = resume ? 'resume' : 'extract'
     supplementary.value = initial ? '' : payload.text
-    await extract()
+    const accepted = await extract()
+    if (accepted) workspaceView.value = 'results'
     await refreshList()
-  } catch (e) { error.value = err(e) }
+    return accepted
+  } catch (e) { error.value = err(e); return false }
   finally { busy.value = false }
 }
 async function openJob(id: number) {
+  requirementPage.value = 1
   invalidateRequests()
   discardProposal()
   const sequence = navigationSequence
@@ -247,6 +300,7 @@ async function openJob(id: number) {
     const current = await api<Job>(`/jobs/${id}`)
     if (sequence !== navigationSequence || disposed) return
     job.value = current; detailTab.value = 'requirements'; selectedQuoteId.value = null
+    workspaceView.value = pendingRows(current).length ? 'supplement' : current.quotes.length || current.requirements.length ? 'results' : 'conversation'
   } catch (e) { if (sequence === navigationSequence) error.value = err(e) }
   finally { if (sequence === navigationSequence) loading.value = false }
 }
@@ -276,7 +330,7 @@ async function applyProposal() {
   let saved = false
   try {
     job.value = await api<Job>(`/jobs/${pending.jobId}/changes`, { method: 'POST',
-      body: JSON.stringify({ revision: pending.revision, changes: pending.changes }) })
+      body: JSON.stringify({ revision: pending.revision, changes: pending.changes, operations: pending.operations }) })
     saved = true
     discardProposal()
     const quote = await api<Quote>(`/jobs/${pending.jobId}/quotes`, { method: 'POST',
@@ -284,10 +338,15 @@ async function applyProposal() {
         terms: job.value.quotes[0]?.terms || '根据用户确认的局部修改重新计价，费用及范围待审核' }) })
     await openJob(pending.jobId)
     selectedQuoteId.value = quote.id
-    detailTab.value = 'quotes'; detailsOpen.value = true
+    workspaceView.value = 'results'; detailsOpen.value = false
     ElMessage.success(`修改已保存并重新计价，生成 V${quote.version}`)
+    if (pending.resumeAfter) {
+      agentMode.value = true; consent.value = true; replace.value = false
+      requestIntent.value = 'resume'; supplementary.value = ''
+      await extract()
+    }
   } catch (e) {
-    if (saved) error.value = `修改已保存，重新计价失败：${err(e)}。请在明细中重新计算报价。`
+    if (saved) error.value = `修改已保存，重新计价失败：${err(e)}。请在报价结果中重新计价。`
     else dialogError.value = err(e)
   } finally { busy.value = false }
 }
@@ -317,8 +376,8 @@ async function deleteConversation(item: Job) {
 function chooseFiles(event: Event) {
   const input = event.target as HTMLInputElement
   const selected = Array.from(input.files || [])
-  if (selected.length + files.value.length > 6) ElMessage.error('最多上传 6 个文件')
-  else if (selected.some(f => f.size > 20 * 1024 * 1024)) ElMessage.error('单个文件不能超过 20MB')
+  const validation = validateAttachments([...files.value, ...selected])
+  if (validation) ElMessage.error(validation)
   else files.value.push(...selected)
   input.value = ''
 }
@@ -327,7 +386,7 @@ function startCreate() {
 }
 async function createJob() {
   dialogError.value = ''
-  if (!createForm.title.trim() || (!files.value.length && !createForm.brief.trim())) { dialogError.value = '请填写任务名称并提供文字或图片/PDF/XLSX'; return }
+  if (!createForm.title.trim() || (!files.value.length && !createForm.brief.trim())) { dialogError.value = '请填写任务名称，并补充说明或上传报价资料'; return }
   busy.value = true
   try {
     const form = new FormData()
@@ -367,13 +426,13 @@ function startExtraction(agent = false) {
   supplementary.value = ''; consent.value = false; replace.value = false; dialogError.value = ''; extractOpen.value = true
 }
 async function extract() {
-  if (!job.value) return
+  if (!job.value) return false
   const intent = !agentMode.value ? 'extract' : requestIntent.value !== 'auto' ? requestIntent.value
     : replace.value ? 'extract'
       : shouldResumeConversation(supplementary.value, 0, Boolean(job.value.requirements.length)) ? 'resume' : 'auto'
   const changingRequirements = !agentMode.value || intent === 'extract' || (intent !== 'resume' && Boolean(supplementary.value.trim()))
   if (!consent.value || (job.value.requirements.length && changingRequirements && !replace.value)) {
-    dialogError.value = '请确认外部处理授权及重新识别影响'; return
+    dialogError.value = '请确认外部处理授权及重新识别影响'; return false
   }
   const id = job.value.id
   const payload = { revision: job.value.revision, supplementary_text: supplementary.value,
@@ -385,24 +444,61 @@ async function extract() {
     const result = await api<Job>(`/jobs/${id}/${isAgent ? 'agent' : 'extract'}`, { method: 'POST', body: JSON.stringify(payload) })
     if (job.value?.id === id) {
       job.value = result
-      if (isAgent && result.agent_runs[0]?.status === 'succeeded') detailTab.value = 'quotes'
-      if (isAgent && result.agent_runs[0]?.status === 'waiting') reviewOpen.value = true
+      if (isAgent && result.agent_runs[0]?.status === 'succeeded') workspaceView.value = 'results'
+      if (isAgent && result.agent_runs[0]?.status === 'waiting') workspaceView.value = 'supplement'
     }
     if (isAgent) ElMessage.info(result.agent_runs[0]?.message || 'Agent 执行结束')
+    else if (result.status === 'processing') ElMessage.info('后台资料整理已启动')
     else ElMessage.success('需求整理完成，等待人工确认')
+    return true
   } catch (e) {
     error.value = err(e)
     try { if (job.value?.id === id) job.value = await api<Job>(`/jobs/${id}`) } catch { /* Preserve actionable error. */ }
+    return false
   } finally { busy.value = false }
 }
-async function continueReview() {
-  if (!job.value || !consent.value || busy.value) return
-  supplementary.value = ''
-  replace.value = false
-  agentMode.value = true
-  requestIntent.value = 'resume'
-  reviewOpen.value = false
-  await extract()
+async function continuePricing() {
+  if (!job.value || busy.value || job.value.status === 'processing' || !config.value.configured) return false
+  supplementary.value = ''; replace.value = false; agentMode.value = true
+  requestIntent.value = job.value.requirements.length ? 'resume' : 'extract'; consent.value = true
+  const accepted = await extract()
+  if (accepted) workspaceView.value = 'results'
+  return accepted
+}
+async function saveSupplement(payload: { edits: SupplementEdit[]; text: string; files: File[]; resume: boolean }) {
+  if (!job.value || busy.value || job.value.status === 'processing') return
+  invalidateRequests()
+  error.value = ''
+  let savedFields = false
+  if (payload.files.length && payload.edits.length) {
+    error.value = '附件会重新整理需求，请先提交附件，再填写项目字段；当前草稿已保留。'; return
+  }
+  try {
+    if (payload.edits.length) {
+      busy.value = true
+      const lines = applySupplementEdits(job.value.requirements, payload.edits)
+      await storeLines(lines, `用户补充${new Set(payload.edits.map(edit => edit.lineId)).size}个项目的信息`)
+      savedFields = true
+      supplementPanel.value?.acceptFields()
+      ElMessage.success('项目补充已保存')
+      busy.value = false
+    }
+    if (payload.text || payload.files.length) {
+      const accepted = await sendChat({ text: payload.text, files: payload.files }, {
+        autoContinue: payload.resume, onFilesAccepted: () => supplementPanel.value?.acceptFiles(),
+      })
+      if (!accepted) {
+        if (savedFields && error.value) error.value = `字段已保存；文字或附件未完成处理：${error.value}`
+        return
+      }
+      supplementPanel.value?.acceptAll()
+      if (proposal.value) return
+    } else supplementPanel.value?.acceptAll()
+    if (payload.resume && job.value?.status !== 'processing') {
+      if (!(await continuePricing()) && savedFields) error.value = `补充已保存，继续报价失败：${error.value || '请重试'}`
+    } else await refreshList()
+  } catch (e) { error.value = `${savedFields ? '部分补充已保存；' : ''}${err(e)}，未提交内容仍保留在草稿中` }
+  finally { busy.value = false }
 }
 function editReviewLine(id: string, match = false) {
   const line = job.value?.requirements.find(item => item.id === id)
@@ -442,6 +538,28 @@ async function storeLines(lines: Line[], why: string) {
   job.value = await api<Job>(`/jobs/${job.value.id}/requirements`, { method: 'PUT',
     body: JSON.stringify({ revision: job.value.revision, lines, reason: why }) })
 }
+async function maintain(action: 'revalidate' | 'refresh_candidates' | 'retry_failed' | 'disable_auto_resume') {
+  if (!job.value || busy.value) return
+  const id = job.value.id
+  const sequence = navigationSequence
+  busy.value = true
+  try {
+    const result = await api<{ job: Job; maintenance: { notice?: string; reopened: string[]
+      searches?: { candidates: unknown[] }[] } }>(`/jobs/${id}/maintenance`, {
+      method: 'POST', body: JSON.stringify({ revision: job.value.revision, action,
+        reason: { revalidate: '管理员重新校验当前报价', refresh_candidates: '管理员重新检索价格依据',
+          retry_failed: '管理员恢复系统受阻项目', disable_auto_resume: '管理员关闭自动恢复' }[action] }),
+    })
+    if (sequence !== navigationSequence || job.value?.id !== id) return
+    job.value = result.job
+    selectedQuoteId.value = null
+    ElMessage.success(result.maintenance.notice || (action === 'refresh_candidates'
+      ? `已检索，找到 ${result.maintenance.searches?.reduce((sum, entry) => sum + entry.candidates.length, 0) || 0} 条候选依据`
+      : action === 'retry_failed' ? `已恢复 ${result.maintenance.reopened.length} 项`
+        : action === 'disable_auto_resume' ? '已关闭自动恢复' : '当前结果已重新校验'))
+  } catch (e) { ElMessage.error(err(e)) }
+  finally { busy.value = false }
+}
 async function saveLine(recalculate = false) {
   if (!editingLine.value || !job.value) return
   dialogError.value = ''
@@ -472,7 +590,7 @@ async function saveLine(recalculate = false) {
           rounding: job.value.quotes[0]?.payload.rounding || 'none' }) })
       await openJob(id)
       selectedQuoteId.value = quote.id
-      detailTab.value = 'quotes'
+      workspaceView.value = 'results'; detailsOpen.value = false
       ElMessage.success(`已重新计价并生成 V${quote.version}`)
     } else ElMessage.success('需求已保存')
     lineOpen.value = false
@@ -528,7 +646,7 @@ async function calculate() {
     const quote = await api<Quote>(`/jobs/${job.value.id}/quotes`, { method: 'POST',
       body: JSON.stringify({ revision: job.value.revision, terms: terms.value, rounding: quoteRounding.value }) })
     await openJob(job.value.id)
-    selectedQuoteId.value = quote.id; detailTab.value = 'quotes'; quoteOpen.value = false
+    selectedQuoteId.value = quote.id; workspaceView.value = 'results'; detailsOpen.value = false; quoteOpen.value = false
   } catch (e) { dialogError.value = err(e) }
   finally { busy.value = false }
 }
@@ -539,6 +657,7 @@ async function approve() {
     const quote = await api<Quote>(`/quotes/${selectedQuote.value.id}/approve`, { method: 'POST',
       body: JSON.stringify({ note: approvalNote.value, confirmed_commercial_terms: commercialConfirmed.value,
         confirmed_estimates: estimatesConfirmed.value,
+        confirmed_source_review: sourcesConfirmed.value,
         terms: selectedQuote.value.payload.generated_by === 'agent' ? approvalTerms.value : undefined }) })
     job.value.quotes = job.value.quotes.map(q => q.id === quote.id ? quote : q)
     approvalOpen.value = false; ElMessage.success('报价已批准')
@@ -554,13 +673,15 @@ async function download(audience: 'customer' | 'review' = 'customer') {
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   } catch (e) { ElMessage.error(err(e)) }
 }
-async function preview(file: CustomerFile, pageNumber = 1) {
+async function preview(file: CustomerFile, pageNumber = 1, region?: number[]) {
   previewFile.value = file; previewPage.value = pageNumber; previewOpen.value = true; previewLoading.value = true
   previewScale.value = 100; previewSource.value = null
   if (previewUrl.value) { URL.revokeObjectURL(previewUrl.value); previewUrl.value = '' }
   const sequence = ++previewSequence
   try {
-    const blob = await apiBlob(`/customer-files/${file.id}/pages/${pageNumber}`)
+    const area = region?.length === 4
+      ? `/region?left=${region[0]}&top=${region[1]}&right=${region[2]}&bottom=${region[3]}` : ''
+    const blob = await apiBlob(`/customer-files/${file.id}/pages/${pageNumber}${area}`)
     if (sequence !== previewSequence || disposed) return
     if (previewUrl.value) URL.revokeObjectURL(previewUrl.value)
     previewUrl.value = URL.createObjectURL(blob)
@@ -583,10 +704,14 @@ async function previewDrawing(url: string) {
   } catch (e) { ElMessage.error(err(e)) }
   finally { if (sequence === previewSequence) previewLoading.value = false }
 }
-function showEvidence(fileId: number, pageNumber: number) {
+function showEvidence(fileId: number, pageNumber: number, region?: number[]) {
   const file = job.value?.files.find(f => f.id === fileId)
-  if (file) preview(file, pageNumber)
+  if (file) preview(file, pageNumber, region)
 }
+watch(() => job.value?.status, (status, before) => {
+  if (before === 'processing' && status && status !== 'processing' && workspaceView.value === 'results'
+    && job.value && pendingRows(job.value).length) workspaceView.value = 'supplement'
+})
 onMounted(() => {
   refresh()
   pollTimer = setInterval(pollProgress, 3000)
@@ -601,22 +726,40 @@ onBeforeUnmount(() => {
 
 <template>
   <QuoteChat ref="chat" :job="job" :jobs="jobs" :total="total" :page="page" :busy="busy" :loading="loading"
-    :configured="config.configured" :error="error" @send="sendChat" @open="openJob" @fresh="newConversation" @remove="deleteConversation"
+    :configured="config.configured" :error="error" v-model:view="workspaceView" @send="sendChat" @open="openJob" @fresh="newConversation" @remove="deleteConversation"
     @settings="key = ''; dialogError = ''; keyOpen = true" @refresh="refresh" @stop="stopAgent" @recover="recover"
     @details="openDetails" @preview="preview" @search="query = $event; page = 1; refresh()"
-    @page="page = $event; refresh()" @manual="startCreate" @edit-estimate="editReviewLine($event)" />
+    @page="page = $event; refresh()" @manual="startCreate" @dismiss-error="error = ''">
+    <template #results>
+      <QuoteResults v-if="job" :job="job" :busy="busy" :configured="config.configured" v-model:quote-id="selectedQuoteId" @maintain="maintain"
+        @approve="approvalNote = ''; commercialConfirmed = false; estimatesConfirmed = false; sourcesConfirmed = false; approvalTerms = selectedQuote?.terms || ''; dialogError = ''; approvalOpen = true"
+        @download="download" @edit="editReviewLine" @supplement="workspaceView = 'supplement'"
+        @continue="continuePricing" @evidence="showEvidence" />
+    </template>
+    <template #supplement>
+      <QuoteSupplement v-if="job" ref="supplementPanel" :job="job" :busy="busy" :configured="config.configured"
+        @submit="saveSupplement" @continue="continuePricing" @edit="editReviewLine" @match="editReviewLine($event, true)" @preview="preview" />
+    </template>
+  </QuoteChat>
   <el-dialog v-model="proposalOpen" title="确认局部需求修改" width="min(720px, 96vw)" :close-on-click-modal="false" :close-on-press-escape="!busy" :show-close="!busy" @open="dialogError = ''" @closed="discardProposal">
-    <div v-for="change in proposal?.changes || []" :key="`${change.line_id}:${change.field}`" class="proposal-change">
-      <strong>{{ job?.requirements.find(line => line.id === change.line_id)?.product }} · {{ fieldLabels[change.field] || change.field }}</strong>
-      <div><span>原始：{{ job?.requirements.find(line => line.id === change.line_id)?.[change.field] ?? '未提供' }}</span><ArrowRight :size="16" /><span>修改为：{{ change.value ?? '未提供' }}</span></div>
+    <div v-for="operation in proposal?.operations || []" :key="`${operation.line_id}:${operation.kind}`" class="proposal-change">
+      <strong>{{ operationLabels[operation.kind] }} · {{ job?.requirements.find(line => line.id === operation.line_id)?.product || operation.new_line?.product }}</strong>
+      <p>{{ operation.reason }}</p>
+      <p v-if="operation.kind === 'add'">数量：{{ operation.new_line?.quantity ?? '待确认' }} · {{ operation.new_line?.material || '材质待确认' }}</p>
+      <p v-if="operation.kind === 'estimate'">费用组成：{{ operation.estimate?.costs.map(cost => cost.label).join('、') || '待补全' }}</p>
+      <p v-if="operation.kind === 'extras'">附加费用：{{ operation.extras?.map(extra => `${extra.label} ${extra.amount} 元`).join('、') }}</p>
+      <details><summary>执行数据</summary><pre style="white-space: pre-wrap; overflow-wrap: anywhere">{{ JSON.stringify(operation, null, 2) }}</pre></details>
+    </div>
+    <div v-for="change in proposal?.changes || []" :key="`${change.line_id}:${change.target_id || ''}:${change.field}`" class="proposal-change">
+      <strong>{{ proposalTarget(change).name }} · {{ fieldLabels[change.field] || change.field }}</strong>
+      <div><span>原始：{{ proposalTarget(change).original ?? '未提供' }}</span><ArrowRight :size="16" /><span>修改为：{{ change.value ?? '未提供' }}</span></div>
       <p>{{ change.reason }}</p>
     </div>
     <div v-if="dialogError" class="form-error">{{ dialogError }}</div>
     <template #footer><el-button :disabled="busy" @click="discardProposal">取消修改</el-button><el-button type="primary" :loading="busy" @click="applyProposal">确认修改并重新计价</el-button></template>
   </el-dialog>
-  <el-drawer v-model="detailsOpen" title="明细与报价" size="min(1080px, 100vw)">
+  <el-drawer v-model="detailsOpen" title="资料与执行记录" size="min(1080px, 100vw)">
   <div class="requirements-workspace">
-    <div class="page-heading"><div><div class="section-eyebrow">CUSTOMER REQUIREMENTS</div><h2>{{ job ? job.title : '客户需求' }}</h2></div></div>
     <div v-if="!config.configured" class="notice-strip"><KeyRound :size="16" /><span>DeepSeek API Key 尚未配置</span><el-button link type="primary" @click="key = ''; dialogError = ''; keyOpen = true">配置密钥</el-button></div>
     <div v-if="error" class="error-banner" role="alert">{{ error }}<button class="icon-button" aria-label="关闭提示" @click="error = ''"><X :size="15" /></button></div>
 
@@ -632,24 +775,16 @@ onBeforeUnmount(() => {
       <div class="pagination-bar"><span>共 {{ total }} 个任务</span><el-pagination v-model:current-page="page" :total="total" :page-size="20" layout="prev, pager, next" @current-change="refresh" /></div>
     </template>
     <template v-else>
-      <div class="job-meta"><button class="source-link" @click="job = null; refresh()"><ArrowLeft :size="14" />全部需求</button><span>{{ job.customer || '未指定客户' }}</span><span>#{{ job.id }} · 需求版本 {{ job.revision }}</span><span :class="['status-badge', job.status === 'ready' ? 'active' : 'draft']">{{ jobLabels[job.status] }}</span></div>
+      <div class="job-meta"><span>{{ job.customer || '未指定客户' }}</span><span>需求版本 {{ job.revision }}</span><span :class="['status-badge', job.status === 'ready' ? 'active' : 'draft']">{{ jobLabels[job.status] }}</span></div>
       <div class="job-meta"><span>报价口径：{{ currentPolicy ? '2026-09-23 现场规则' : '历史口径' }}</span><el-button v-if="!currentPolicy" link :disabled="busy || job.status === 'processing'" @click="adoptPolicy">采用现场口径</el-button></div>
-      <section class="customer-files"><div class="section-title"><h2>客户资料</h2><span>{{ job.files.reduce((sum, f) => sum + f.page_count, 0) }} 页</span></div><div class="file-list"><button v-for="file in job.files" :key="file.id" class="customer-file" @click="preview(file)"><component :is="isExcel(file) ? Table2 : file.media_type === 'application/pdf' ? FileText : FileImage" :size="22" /><div><strong>{{ file.filename }}</strong><small>{{ file.page_count }} 页 · {{ (file.byte_size / 1024).toFixed(0) }} KB</small></div><ChevronRight :size="15" /></button></div><p v-if="job.brief" class="brief-text">{{ job.brief }}</p></section>
-      <div class="job-actions"><span>{{ job.extraction.summary || '需求整理' }}</span><el-button v-if="job.status === 'processing' && !latestAgent?.usage.durable" @click="recover">恢复中断任务</el-button><el-button v-if="latestAgent?.status === 'processing'" type="danger" plain @click="stopAgent"><X :size="16" />停止</el-button><el-button :disabled="busy || !config.configured || job.status === 'processing'" @click="startExtraction(false)">{{ job.requirements.length ? '手动补充识别' : '仅识别' }}</el-button><el-button type="primary" :disabled="busy || !config.configured || job.status === 'processing'" :loading="job.status === 'processing'" @click="startExtraction(true)"><Sparkles :size="16" />{{ latestAgent ? '继续 Agent 报价' : 'Agent 自动报价' }}</el-button></div>
-      <section v-if="latestAgent" class="agent-progress">
-        <div class="section-title"><h2>Agent #{{ latestAgent.id }}</h2><span>{{ agentStatus[latestAgent.status] || latestAgent.status }} · {{ latestAgent.steps.length }} 步 · {{ latestAgent.usage.total_tokens || 0 }} tokens</span></div>
-        <p v-if="latestAgent.message" class="brief-text">{{ latestAgent.message }}</p>
-        <details v-for="(step, index) in latestAgent.steps" :key="index" class="agent-step">
-          <summary>{{ index + 1 }}. {{ toolLabels[step.tool] || step.tool }} <span v-if="step.arguments.query">· {{ step.arguments.query }}</span><span v-if="step.tool === 'search_prices'"> · {{ step.result.total ?? 0 }} 条</span><span v-else-if="step.result.total"> · ¥ {{ step.result.total }}</span><span v-if="step.result.selected"> · 已关联</span><span v-if="step.result.error"> · 参数待修正</span></summary>
-          <AgentStepDetails :key="`${latestAgent.id}:${index}`" :job-id="job.id" :run-id="latestAgent.id" :index="index" />
-        </details>
-      </section>
+      <section class="customer-files"><div class="section-title"><h2>客户资料</h2><span>{{ job.files.reduce((sum, f) => sum + f.page_count, 0) }} 页</span></div><div class="file-list"><button v-for="file in job.files" :key="file.id" class="customer-file" @click="preview(file)"><component :is="isExcel(file) ? Table2 : file.media_type === 'application/pdf' ? FileText : FileImage" :size="22" /><div><strong>{{ file.filename }}</strong><small>{{ file.page_count }} 页 · {{ (file.byte_size / 1024).toFixed(0) }} KB</small><small v-if="file.resource_summary">图纸 {{ file.resource_summary.resolved }}/{{ file.resource_summary.discovered }}<span v-if="file.resource_summary.unresolved"> · {{ file.resource_summary.unresolved }} 项未读取</span></small></div><ChevronRight :size="15" /></button></div><p v-if="job.brief" class="brief-text">{{ job.brief }}</p></section>
+      <div class="job-actions"><span>{{ job.extraction.summary || '客户资料' }}</span><el-button :disabled="busy || !config.configured || job.status === 'processing'" @click="startExtraction(false)">重新整理资料</el-button></div>
       <div v-if="job.runs[0]?.error" class="error-banner">{{ job.runs[0].error }}</div>
       <div v-if="job.extraction.questions?.length" class="questions-band"><h3>模型提出的待核实项</h3><ul><li v-for="question in job.extraction.questions" :key="question">{{ question }}</li></ul></div>
       <el-tabs v-model="detailTab">
         <el-tab-pane :label="`需求明细 (${job.requirements.length})`" name="requirements">
           <div class="detail-toolbar"><span>{{ job.pending_count }} 项待确认</span><el-button :disabled="busy || job.status === 'processing'" @click="editLine()"><Plus :size="15" />添加明细</el-button><el-button type="primary" :disabled="busy || !job.requirements.length || job.status === 'processing'" @click="startQuote">计算报价</el-button></div>
-          <el-table class="requirements-desktop-table" :data="job.requirements" empty-text="暂无需求明细">
+          <el-table class="requirements-desktop-table" :data="visibleRequirements" empty-text="暂无需求明细">
             <el-table-column label="产品 / 文字" min-width="185"><template #default="{ row }"><button class="product-link" @click="editLine(row)">{{ row.product || '产品待确认' }}</button><div class="cell-secondary">{{ row.text_content || '—' }}</div><span :class="['status-badge', row.confirmed ? 'active' : 'draft']">{{ row.confirmed ? '已核实' : '待核实' }}</span></template></el-table-column>
             <el-table-column label="规格 / 材质" min-width="170"><template #default="{ row }">{{ row.width_mm || '?' }} × {{ row.height_mm || '?' }} mm<div class="cell-secondary">{{ row.material || '材质未指定' }} {{ row.thickness_mm ? `${row.thickness_mm}mm` : '' }} · {{ row.process || '工艺未指定' }}</div></template></el-table-column>
             <el-table-column label="数量" width="80"><template #default="{ row }">{{ row.quantity ?? '待确认' }}</template></el-table-column>
@@ -658,21 +793,12 @@ onBeforeUnmount(() => {
             <el-table-column label="来源" min-width="120"><template #default="{ row }"><button v-for="(e, index) in row.evidence" :key="index" class="source-link evidence-link" @click="showEvidence(e.file_id, e.page)">{{ e.sheet ? `${e.sheet}!${e.cell}` : `文件 ${e.file_id} · ${e.page} 页` }}</button><el-tooltip v-if="row.text_evidence?.length" :content="row.text_evidence.join('；')"><span class="cell-secondary">客户对话文字</span></el-tooltip><span v-else-if="!row.evidence.length" class="cell-secondary">人工录入</span></template></el-table-column>
             <el-table-column width="80" fixed="right"><template #default="{ row }"><button class="icon-button" aria-label="编辑需求" :disabled="busy || job.status === 'processing'" @click="editLine(row)"><Pencil :size="15" /></button><button class="icon-button danger" aria-label="删除需求" :disabled="busy || job.status === 'processing'" @click="removeLine(row)"><Trash2 :size="15" /></button></template></el-table-column>
           </el-table>
-          <div class="requirements-mobile-list"><article v-for="line in job.requirements" :key="line.id"><div class="mobile-line-heading"><strong>{{ line.product || '产品待确认' }}</strong><span :class="['status-badge', line.confirmed ? 'active' : 'draft']">{{ line.confirmed ? '已核实' : '待核实' }}</span><button class="icon-button" aria-label="编辑需求" :disabled="busy || job.status === 'processing'" @click="editLine(line)"><Pencil :size="15" /></button><button class="icon-button danger" aria-label="删除需求" :disabled="busy || job.status === 'processing'" @click="removeLine(line)"><Trash2 :size="15" /></button></div><p>{{ line.width_mm || '?' }} × {{ line.height_mm || '?' }} mm · {{ line.quantity ?? '?' }} 件</p><p>{{ line.material || '材质未指定' }} {{ line.thickness_mm ? `${line.thickness_mm}mm` : '' }} · {{ line.process || '工艺未指定' }}</p><p v-if="line.text_content">{{ line.text_content }}</p><el-button link type="primary" :disabled="busy || job.status === 'processing'" @click="matchLine(line)"><Link :size="14" />{{ line.selected_price_id ? `价格 #${line.selected_price_id} · v${line.selected_price_revision}` : '匹配价格' }}</el-button><button v-for="e in line.evidence" :key="`${e.file_id}-${e.page}`" class="source-link evidence-link" @click="showEvidence(e.file_id, e.page)">来源：文件 {{ e.file_id }} · 第 {{ e.page }} 页</button></article><el-empty v-if="!job.requirements.length" description="暂无需求明细" /></div>
+          <div class="requirements-mobile-list"><article v-for="line in visibleRequirements" :key="line.id"><div class="mobile-line-heading"><strong>{{ line.product || '产品待确认' }}</strong><span :class="['status-badge', line.confirmed ? 'active' : 'draft']">{{ line.confirmed ? '已核实' : '待核实' }}</span><button class="icon-button" aria-label="编辑需求" :disabled="busy || job.status === 'processing'" @click="editLine(line)"><Pencil :size="15" /></button><button class="icon-button danger" aria-label="删除需求" :disabled="busy || job.status === 'processing'" @click="removeLine(line)"><Trash2 :size="15" /></button></div><p>{{ line.width_mm || '?' }} × {{ line.height_mm || '?' }} mm · {{ line.quantity ?? '?' }} 件</p><p>{{ line.material || '材质未指定' }} {{ line.thickness_mm ? `${line.thickness_mm}mm` : '' }} · {{ line.process || '工艺未指定' }}</p><p v-if="line.text_content">{{ line.text_content }}</p><el-button link type="primary" :disabled="busy || job.status === 'processing'" @click="matchLine(line)"><Link :size="14" />{{ line.selected_price_id ? `价格 #${line.selected_price_id} · v${line.selected_price_revision}` : '匹配价格' }}</el-button><button v-for="e in line.evidence" :key="`${e.file_id}-${e.page}`" class="source-link evidence-link" @click="showEvidence(e.file_id, e.page)">来源：文件 {{ e.file_id }} · 第 {{ e.page }} 页</button></article><el-empty v-if="!job.requirements.length" description="暂无需求明细" /></div>
+          <el-pagination v-if="job.requirements.length > 50" v-model:current-page="requirementPage" :total="job.requirements.length" :page-size="50" layout="total, prev, pager, next" />
         </el-tab-pane>
-        <el-tab-pane :label="`报价草稿 (${job.quotes.length})`" name="quotes">
-          <template v-if="selectedQuote"><div class="detail-toolbar"><el-select v-model="selectedQuoteId" :placeholder="`版本 ${selectedQuote.version}`" style="width: 160px"><el-option v-for="q in job.quotes" :key="q.id" :value="q.id" :label="`报价版本 ${q.version}`" /></el-select><span :class="['status-badge', selectedQuote.status === 'approved' ? 'active' : 'draft']">{{ selectedQuote.status === 'approved' ? '已批准' : selectedQuote.status === 'blocked' ? '存在阻塞项' : '待审核' }}</span><el-button v-if="selectedQuote.status === 'draft'" :disabled="selectedQuote.outdated" type="primary" @click="approvalNote = ''; commercialConfirmed = false; dialogError = ''; approvalOpen = true">批准报价</el-button><el-button :disabled="selectedQuote.outdated" @click="download('review')"><Download :size="15" />导出内部审核 CSV</el-button><el-button v-if="selectedQuote.status === 'approved'" :disabled="selectedQuote.outdated" @click="download('customer')"><Download :size="15" />导出 CSV</el-button></div>
-          <p v-if="selectedQuote.payload.business_rules" class="brief-text">规则版本 {{ selectedQuote.payload.business_rules.version }} · 不含{{ selectedQuote.payload.business_rules.excluded_fees.join('、') }}</p>
-          <p v-if="selectedQuote.payload.rounding && selectedQuote.payload.rounding !== 'none'" class="brief-text">取整前 {{ money(selectedQuote.payload.unrounded_total ?? null) }} 元 · 取整调整 {{ selectedQuote.payload.rounding_adjustment }} 元</p>
-          <div v-if="selectedQuote.outdated" class="error-banner">此报价未通过当前需求、价格或计价校验，历史金额已失效。</div>
-          <details v-if="selectedQuote.payload.lines.some(line => line.warnings?.length) || selectedQuote.payload.review_questions?.length" class="quote-review-warnings"><summary>初步报价待复核条件</summary><p v-for="line in selectedQuote.payload.lines.filter(line => line.warnings?.length)" :key="line.line_id">{{ line.product }}：{{ line.warnings?.join('；') }}</p><p v-if="selectedQuote.payload.review_questions?.length">{{ selectedQuote.payload.review_questions.join('；') }}</p></details>
-          <el-table class="requirements-desktop-table" :data="selectedQuote.payload.lines"><el-table-column prop="product" label="产品" min-width="160" /><el-table-column label="单价 / 估价依据" min-width="310"><template #default="{ row }"><QuotePricingDetails :line="row" /><span v-if="!row.blockers.length" class="formula-text">{{ row.formula }}</span><ul v-else-if="!selectedQuote.payload.confirmation_items" class="blocker-list"><li v-for="b in row.blockers" :key="b">{{ b }}</li></ul></template></el-table-column><el-table-column label="成品金额(CNY)" align="right" width="140"><template #default="{ row }"><strong>{{ money(row.amount) }}</strong></template></el-table-column></el-table>
-          <div class="requirements-mobile-list"><article v-for="line in selectedQuote.payload.lines" :key="line.line_id"><div class="mobile-line-heading"><strong>{{ line.product }}</strong><strong class="mobile-amount">{{ line.amount === null ? '未计价' : `¥ ${money(line.amount)}` }}</strong></div><QuotePricingDetails :line="line" /><p v-if="!line.blockers.length" class="formula-text">{{ line.formula }}</p><ul v-else-if="!selectedQuote.payload.confirmation_items" class="blocker-list"><li v-for="b in line.blockers" :key="b">{{ b }}</li></ul></article></div>
-          <QuoteConfirmations :items="selectedQuote.payload.confirmation_items" :requirements="selectedQuote.payload.lines.map(line => line.requirement)" />
-          <QuoteVersionDiff :current="selectedQuote" :previous="previousQuote" />
-          <EstimateReviewList :lines="selectedQuote.payload.lines" :disabled="busy || job.status === 'processing'" @edit="editReviewLine($event)" />
-          <div :class="['quote-total', { 'outdated-total': selectedQuote.outdated }]"><span>{{ selectedQuote.outdated ? '历史金额（已失效）' : selectedQuote.payload.complete ? '报价合计' : quoteDisplayTotal(selectedQuote.payload) === null ? '成品总价待补充' : '已计价成品小计（非完整报价）' }}</span><strong>{{ quoteDisplayTotal(selectedQuote.payload) === null ? '待确认' : `¥ ${money(quoteDisplayTotal(selectedQuote.payload))}` }}</strong></div><div class="quote-terms"><h3>报价条款</h3><p>{{ selectedQuote.terms }}</p><p v-if="selectedQuote.approval_note">批准说明：{{ selectedQuote.approval_note }}</p></div></template>
-          <el-empty v-else description="暂无报价草稿" />
+        <el-tab-pane label="执行记录" name="execution">
+          <PipelineAudit v-if="detailsOpen && detailTab === 'execution'" :job-id="job.id" :revision="job.revision" :disabled="job.status === 'processing'" @preview="showEvidence" />
+          <details v-for="run in job.agent_runs" :key="run.id" class="result-secondary-section"><summary>{{ date(run.created_at) }} · {{ run.status }} · {{ run.steps.length }} 个步骤</summary><p>{{ run.message }}</p><details v-for="(step, index) in run.steps" :key="index" class="agent-step"><summary>{{ index + 1 }} · {{ step.tool }}</summary><pre>{{ JSON.stringify({ arguments: step.arguments, result: step.result }, null, 2) }}</pre></details></details>
         </el-tab-pane>
         <el-tab-pane label="补充与识别记录" name="history"><div v-for="m in job.messages" :key="m.at" class="message-row"><strong>{{ m.role === 'user' ? '补充需求' : '模型整理' }}</strong><span>{{ date(m.at) }}</span><p>{{ m.text }}</p></div><div v-for="run in job.runs" :key="run.id" class="message-row"><strong>识别 #{{ run.id }} · {{ run.status }}</strong><span>{{ date(run.created_at) }}</span><p>{{ run.model }} · {{ run.attempts }} 次调用 · {{ run.usage.total_tokens || 0 }} tokens</p><p v-if="run.error" class="warning-text">{{ run.error }}</p></div><el-empty v-if="!job.messages.length && !job.runs.length" description="暂无识别记录" /></el-tab-pane>
       </el-tabs>
@@ -684,7 +810,7 @@ onBeforeUnmount(() => {
     <el-form label-position="top">
       <div class="form-grid"><el-form-item label="任务名称" required><el-input v-model="createForm.title" maxlength="150" /></el-form-item><el-form-item label="客户名称"><el-input v-model="createForm.customer" maxlength="150" /></el-form-item></div>
       <el-form-item label="客户补充说明"><el-input v-model="createForm.brief" type="textarea" :rows="3" maxlength="8000" /></el-form-item>
-      <el-form-item label="图片 / PDF / XLSX"><input ref="fileInput" type="file" hidden multiple accept=".jpg,.jpeg,.png,.webp,.pdf,.xlsx" @change="chooseFiles" /><el-button @click="fileInput?.click()"><Upload :size="16" />选择文件</el-button><span class="upload-limits">最多 6 个文件 · 20MB/文件 · 图片/PDF合计20页 · Excel图纸不限张数</span></el-form-item>
+      <el-form-item label="报价资料"><input ref="fileInput" type="file" hidden multiple :accept="attachmentAccept" @change="chooseFiles" /><el-button @click="fileInput?.click()"><Upload :size="16" />选择文件</el-button><span class="upload-limits">最多 {{ uploadLimits.max_files }} 个文件 · PDF {{ uploadLimits.max_pdf_bytes / 1024 / 1024 }}MB/份 · 其他 {{ uploadLimits.max_file_bytes / 1024 / 1024 }}MB/份 · 合计 {{ uploadLimits.max_job_bytes / 1024 / 1024 }}MB / {{ uploadLimits.max_pages }} 页</span></el-form-item>
       <div v-for="(file, index) in files" :key="index" class="upload-row"><FileText :size="16" /><span>{{ file.name }}</span><small>{{ (file.size / 1024).toFixed(0) }} KB</small><button class="icon-button" aria-label="移除文件" @click="files.splice(index, 1)"><X :size="15" /></button></div>
       <div class="consent-fields"><el-checkbox v-model="autoRun" :disabled="!config.configured">上传后自动报价，并授权将客户资料及候选报价数据发送至 {{ externalProviders }}</el-checkbox></div>
       <div v-if="dialogError" class="form-error" role="alert">{{ dialogError }}</div>
@@ -704,30 +830,13 @@ onBeforeUnmount(() => {
 
   <el-dialog v-model="extractOpen" :title="agentMode ? 'Agent 自动报价' : 'DeepSeek 需求整理'" width="660px" :close-on-click-modal="false"><el-form label-position="top"><el-form-item label="本次补充 / 客户回答"><el-input v-model="supplementary" type="textarea" :rows="5" maxlength="8000" /></el-form-item><div class="consent-fields"><el-checkbox v-model="consent">同意将本任务图片、需求、补充说明及候选报价数据发送至 {{ agentMode ? externalProviders : 'DeepSeek' }}</el-checkbox><el-checkbox v-if="job?.requirements.length" v-model="replace">重新识别将替换当前需求，清除价格关联，并使原报价失效</el-checkbox></div><div v-if="dialogError" class="form-error">{{ dialogError }}</div></el-form><template #footer><el-button @click="extractOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="extract"><Sparkles :size="16" />{{ agentMode ? '开始自动报价' : '开始识别' }}</el-button></template></el-dialog>
 
-  <el-dialog v-model="reviewOpen" title="补充报价信息" width="820px" :close-on-click-modal="false">
-    <p v-if="job?.quotes[0]">已计价小计：{{ quoteDisplayTotal(job.quotes[0].payload) === null ? '暂无' : `¥ ${money(quoteDisplayTotal(job.quotes[0].payload))}` }} · 未计价 {{ reviewLines.length }} 项</p>
-    <QuoteConfirmations :items="job?.quotes[0]?.payload.confirmation_items" :questions="job?.quotes[0]?.payload.review_questions" :requirements="job?.quotes[0]?.payload.lines.map(line => line.requirement)" />
-    <div class="quote-review-list"><article v-for="line in reviewLines" :key="line.line_id">
-      <strong>{{ line.requirement.source_item ? `#${line.requirement.source_item} ` : '' }}{{ line.product }}</strong>
-      <QuotePricingDetails :line="line" />
-      <p v-if="!job?.quotes[0]?.payload.confirmation_items">{{ line.blockers.join('；') }}</p>
-      <el-button :disabled="busy" @click="editReviewLine(line.line_id)"><Pencil :size="14" />补充资料或单价</el-button>
-      <el-button :disabled="busy" @click="editReviewLine(line.line_id, true)"><Link :size="14" />匹配库内价格</el-button>
-    </article></div>
-    <details v-if="reviewWarnings.length" class="quote-review-warnings"><summary>待复核条件 · {{ reviewWarnings.length }} 项</summary>
-      <p v-for="line in reviewWarnings" :key="line.line_id"><strong>{{ line.product }}：</strong>{{ line.warnings?.join('；') }}</p>
-    </details>
-    <el-checkbox v-model="consent">授权将修订后的需求及候选报价发送至 {{ externalProviders }}</el-checkbox>
-    <div v-if="error" class="form-error">{{ error }}</div>
-    <template #footer><el-button @click="reviewOpen = false">稍后补充</el-button><el-button type="primary" :disabled="!consent" :loading="busy" @click="continueReview"><ArrowRight :size="15" />继续报价</el-button></template>
-  </el-dialog>
   <el-dialog v-model="lineOpen" title="需求明细" width="820px" :close-on-click-modal="false"><el-form v-if="editingLine" label-position="top">
     <div class="form-grid"><el-form-item label="报价类别"><el-select v-model="editingLine.pricing_category" filterable clearable><el-option v-for="product in pricingProducts" :key="product.id" :value="product.name" :label="product.name" /></el-select></el-form-item><el-form-item label="类别认定依据"><el-input v-model="editingLine.category_basis" maxlength="1500" /></el-form-item></div>
     <div class="form-grid"><el-form-item label="人工不含税单价（元/件）"><el-input v-model="editingLine.manual_unit_price" inputmode="decimal" clearable @clear="editingLine.manual_unit_price = null" /></el-form-item><el-form-item label="人工补价依据及包含范围"><el-input v-model="editingLine.manual_price_note" maxlength="2000" /></el-form-item></div>
     <div class="form-grid"><el-form-item label="产品名称"><el-input v-model="editingLine.product" maxlength="150" /></el-form-item><el-form-item label="文字内容"><el-input v-model="editingLine.text_content" maxlength="1000" /></el-form-item><el-form-item label="材质"><el-input v-model="editingLine.material" maxlength="100" /></el-form-item><el-form-item label="厚度 (mm)"><el-input v-model="editingLine.thickness_mm" inputmode="decimal" /></el-form-item><el-form-item label="单件宽 (mm)"><el-input v-model="editingLine.width_mm" inputmode="decimal" /></el-form-item><el-form-item label="单件高 (mm)"><el-input v-model="editingLine.height_mm" inputmode="decimal" /></el-form-item><el-form-item label="单件数量"><el-input-number v-model="editingLine.quantity" :min="1" :max="1000000" :precision="0" /></el-form-item><el-form-item label="文字类型"><el-select v-model="editingLine.language"><el-option v-for="(label, value) in languageLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="工艺"><el-input v-model="editingLine.process" maxlength="255" /></el-form-item><el-form-item label="每件计价长度 (mm)"><el-input v-model="editingLine.billing_length_mm" inputmode="decimal" placeholder="仅按 cm / m 计价时填写" /></el-form-item></div>
     <BusinessFields v-if="currentPolicy" :line="editingLine" />
     <QuantitySources :line="editingLine" />
-    <el-button v-if="!editingLine.estimate && currentPolicy" @click="editingLine.estimate = { assumptions: [], costs: [], scope: businessTerms, contract_version: 2, pricing_strategy: 'auto' }"><Plus :size="14" />建立费用方案</el-button>
+    <el-button v-if="!editingLine.estimate && currentPolicy" @click="editingLine.estimate = { assumptions: [], costs: [], scope: businessTerms, contract_version: 3, pricing_strategy: 'auto' }"><Plus :size="14" />建立费用方案</el-button>
     <EstimateEditor v-if="editingLine.estimate" :plan="editingLine.estimate" :line="editingLine" :current-policy="currentPolicy" />
     <el-form-item label="备注 / 不确定项"><el-input v-model="editingLine.notes" type="textarea" :rows="2" /><ul v-if="editingLine.uncertainties.length" class="blocker-list"><li v-for="u in editingLine.uncertainties" :key="u">{{ u }}</li></ul></el-form-item>
     <div class="section-title"><h3>人工确认附加费用</h3><el-button link type="primary" @click="editingLine.extras.push({ label: '', amount: '0', basis: 'total', reason: '' })"><Plus :size="14" />添加费用</el-button></div>
@@ -738,6 +847,6 @@ onBeforeUnmount(() => {
   <el-drawer v-model="candidateOpen" title="匹配报价库" size="min(950px, 100vw)"><form class="search-box" @submit.prevent="searchCandidates"><Search :size="16" /><input v-model="candidateSearch" placeholder="产品名称或材质" aria-label="搜索候选价格" /><button type="submit" class="search-submit" aria-label="执行价格匹配"><ArrowRight :size="16" /></button></form><el-tabs><el-tab-pane :label="`候选价格 (${candidates.length})`"><el-table v-loading="candidateLoading" :data="candidates" empty-text="没有匹配价格，请调整搜索词或在报价库中新增"><el-table-column label="产品 / 规格" min-width="205"><template #default="{ row }"><strong>{{ row.product }}</strong><div class="cell-secondary">{{ row.spec }} · {{ row.material }} {{ row.thickness_mm }} · {{ languageLabels[row.language] }}</div><div class="cell-secondary">{{ row.process }} {{ row.quality }}</div><span v-if="row.mismatches.length" class="warning-text">{{ row.mismatches.join('；') }}</span><p class="cell-secondary">{{ row.notes }}</p></template></el-table-column><el-table-column label="单价" width="130" align="right"><template #default="{ row }">{{ row.amount }}<div class="cell-secondary">{{ unitLabels[row.unit] }}</div><span :class="['status-badge', row.status]">{{ statusLabels[row.status] }}</span></template></el-table-column><el-table-column label="来源" min-width="130"><template #default="{ row }"><span class="cell-secondary">{{ row.source ? `${row.source.sheet}!${row.source.cell}` : '手动录入' }}</span><div class="cell-secondary">#{{ row.id }} · v{{ row.revision }}</div></template></el-table-column><el-table-column width="80" fixed="right"><template #default="{ row }"><el-button link type="primary" :disabled="row.status !== 'active' || row.mismatches.length > 0" @click="choosePrice(row)">选择</el-button></template></el-table-column></el-table></el-tab-pane><el-tab-pane :label="`相关规则原文 (${candidateRules.length})`"><article v-for="rule in candidateRules" :key="rule.id" class="rule-reference"><h3>{{ rule.name }}</h3><p>{{ rule.content }}</p><span class="cell-secondary">{{ rule.source_cell }} · {{ statusLabels[rule.status] }}</span></article></el-tab-pane></el-tabs></el-drawer>
 
   <el-dialog v-model="quoteOpen" title="计算报价草稿" width="650px"><el-form label-position="top"><el-form-item :label="currentPolicy ? '报价条款：排除费用范围、有效期' : '报价条款：税费、运费、安装费、有效期'" required><el-input v-model="terms" type="textarea" :rows="6" maxlength="4000" /></el-form-item><el-form-item label="整单商业取整"><el-select v-model="quoteRounding" aria-label="整单商业取整"><el-option label="不取整，保留分" value="none" /><el-option label="四舍五入到元（需审核）" value="yuan" /><el-option label="四舍五入到十元（需审核）" value="ten" /><el-option label="四舍五入到百元（需审核）" value="hundred" /></el-select></el-form-item><div v-if="dialogError" class="form-error">{{ dialogError }}</div></el-form><template #footer><el-button @click="quoteOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="calculate">计算草稿</el-button></template></el-dialog>
-  <el-dialog v-model="approvalOpen" title="批准报价" width="580px" @open="approvalTerms = selectedQuote?.payload.business_rules ? businessTerms : ''; estimatesConfirmed = false"><el-form label-position="top"><el-form-item label="审核说明" required><el-input v-model="approvalNote" aria-label="审核说明" type="textarea" :rows="3" /></el-form-item><el-form-item v-if="selectedQuote?.payload.generated_by === 'agent'" :label="selectedQuote.payload.business_rules ? '正式条款：排除费用范围及有效期' : '正式条款：税费、运费、安装费及有效期'" required><el-input v-model="approvalTerms" aria-label="正式报价条款" type="textarea" :rows="4" maxlength="4000" /></el-form-item><el-checkbox v-if="selectedQuote?.payload.has_estimates" v-model="estimatesConfirmed">已逐项审核并确认补全参数、估算费用和报价范围</el-checkbox><el-checkbox v-model="commercialConfirmed">{{ selectedQuote?.payload.business_rules ? '已确认价格适用性、排除费用范围、取整策略及条款' : '已确认价格适用性、税费、运费、安装费及条款' }}</el-checkbox><div v-if="dialogError" class="form-error">{{ dialogError }}</div></el-form><template #footer><el-button @click="approvalOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="approve"><Check :size="15" />批准</el-button></template></el-dialog>
+  <el-dialog v-model="approvalOpen" title="批准报价" width="580px" @open="approvalTerms = selectedQuote?.payload.business_rules ? businessTerms : ''; estimatesConfirmed = false; sourcesConfirmed = false"><el-form label-position="top"><el-form-item label="审核说明" required><el-input v-model="approvalNote" aria-label="审核说明" type="textarea" :rows="3" /></el-form-item><el-form-item v-if="selectedQuote?.payload.generated_by === 'agent'" :label="selectedQuote.payload.business_rules ? '正式条款：排除费用范围及有效期' : '正式条款：税费、运费、安装费及有效期'" required><el-input v-model="approvalTerms" aria-label="正式报价条款" type="textarea" :rows="4" maxlength="4000" /></el-form-item><el-checkbox v-if="selectedQuote?.payload.has_estimates" v-model="estimatesConfirmed">已逐项审核并确认补全参数、估算费用和报价范围</el-checkbox><el-checkbox v-if="selectedQuote?.payload.source_review?.required" v-model="sourcesConfirmed">已核对未读清区域、跨文件归属和订购范围，确认无漏项或重复计费</el-checkbox><el-checkbox v-model="commercialConfirmed">{{ selectedQuote?.payload.business_rules ? '已确认价格适用性、排除费用范围、取整策略及条款' : '已确认价格适用性、税费、运费、安装费及条款' }}</el-checkbox><div v-if="dialogError" class="form-error">{{ dialogError }}</div></el-form><template #footer><el-button @click="approvalOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="approve"><Check :size="15" />批准</el-button></template></el-dialog>
   <el-dialog v-model="previewOpen" :title="previewFile?.filename" width="1000px"><div class="preview-toolbar"><button class="icon-button bordered" aria-label="上一页" :disabled="previewPage <= 1" @click="previewFile && preview(previewFile, previewPage - 1)"><ChevronLeft :size="17" /></button><span>{{ previewPage }} / {{ previewFile?.page_count }}</span><button class="icon-button bordered" aria-label="下一页" :disabled="previewPage >= (previewFile?.page_count || 1)" @click="previewFile && preview(previewFile, previewPage + 1)"><ChevronRight :size="17" /></button><el-tooltip content="缩小图纸"><button class="icon-button bordered" aria-label="缩小图纸" :disabled="previewScale <= 50" @click="previewScale = Math.max(50, previewScale - 25)"><ZoomOut :size="17" /></button></el-tooltip><span>{{ previewScale }}%</span><el-tooltip content="放大图纸"><button class="icon-button bordered" aria-label="放大图纸" :disabled="previewScale >= 400" @click="previewScale = Math.min(400, previewScale + 25)"><ZoomIn :size="17" /></button></el-tooltip></div><div v-loading="previewLoading" class="customer-preview zoom-preview"><img v-if="previewUrl" :src="previewUrl" :style="{ width: `${previewScale}%`, maxWidth: 'none' }" :alt="`${previewFile?.filename} 第 ${previewPage} 页`" /></div><section v-if="previewSource" class="excel-source"><h3>{{ previewSource.sheet }} · 原始行 {{ previewSource.row_start }}–{{ previewSource.row_end }}</h3><p v-if="previewSource.images.length">图纸 {{ previewSource.images.length }} 张</p><div class="source-image-actions"><el-button v-for="(image, index) in previewSource.images" :key="image.url" @click="previewDrawing(image.url)"><FileImage :size="14" />图纸 {{ image.cell }}{{ previewSource.images.length > 1 ? ` · ${index + 1}` : '' }}</el-button><el-button @click="previewFile && preview(previewFile, previewPage)">整页资料</el-button></div><p v-for="warning in previewSource.warnings" :key="warning">{{ warning }}</p><details><summary>单元格原文与公式缓存</summary><p>{{ previewSource.notice }}</p><div v-for="row in previewSource.rows" :key="row.row" class="excel-source-row"><span v-for="cell in row.cells" :key="cell.cell"><strong>{{ cell.cell }}</strong> {{ cell.value }}<small v-if="cell.formula">{{ cell.formula }} · {{ cell.formula_status === 'missing_cache' ? '无缓存值' : '缓存值未验证' }}</small></span></div></details></section></el-dialog>
 </template>

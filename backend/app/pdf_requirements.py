@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from .requirements_schemas import ExtractedLine, Evidence
 
-ROW = re.compile(r"(?<![\d.])(\d{1,3})[ \t]+(?=[\u4e00-\u9fffA-Za-z])")
+ROW = re.compile(r"(?<![\d.])(\d{1,5})[ \t]+(?=[\u4e00-\u9fffA-Za-z])")
 DIMENSION = re.compile(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*[*xX×]\s*(\d+(?:\.\d+)?)"
                        r"\s*(?:mm)?(?:\s*[*xX×]\s*(\d+(?:\.\d+)?))?", re.I)
 STEEL = re.compile(r"(\d+(?:\.\d+)?)\s*mm\s*(?:TH[HK]+\.?\s*)?(?:厚\s*)?(?:304#\s*)?不锈钢", re.I)
@@ -23,7 +23,7 @@ def outer_dimensions(raw):
 
 def source_rows(text):
     # Only recognize a numbered table when several plausible rows are present.
-    matches = [m for m in ROW.finditer(text) if int(m[1]) <= 100
+    matches = [m for m in ROW.finditer(text) if int(m[1]) <= 10000
                and not re.match(r"(?:mm|cm|m2|THK)\b", text[m.end():], re.I)]
     if len(matches) < 2:
         return {}
@@ -78,6 +78,6 @@ def validate_rows(result, texts):
                 source_item=item, product=row["name"][:150], notes=row["text"][:4000],
                 evidence=[Evidence(file_id=file_id, page=page, text=row["text"][:1500])],
                 uncertainties=["该行由PDF文本层补回，模型未完整提取，请核对规格及数量"]))
-    if len(result.lines) > 100:
+    if len(result.lines) > 10000:
         raise ValueError("Too many source rows")
     return result

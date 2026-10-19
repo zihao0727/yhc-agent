@@ -29,7 +29,7 @@ if not _app_logger.handlers:
 @asynccontextmanager
 async def lifespan(app):
     worker = None
-    if settings().agent_background:
+    if settings().agent_background and settings().agent_worker_mode == "embedded":
         from .agent_worker import start_worker
         worker = start_worker()
     yield
@@ -119,6 +119,8 @@ def price_view(db, item, detail=False):
     category = db.get(Category, product.category_id)
     data.update(product=product.name, category=category.name, category_id=category.id,
                 source=source_info(db, item.source_record_id, item.source_cell))
+    from .catalog_search import catalog_profile
+    data["catalog_profile"] = catalog_profile(item)
     from .estimate_pricing import catalog_coverage
     try:
         data["included_cost_kinds"] = catalog_coverage(item.attributes)
@@ -133,28 +135,20 @@ def price_view(db, item, detail=False):
 def prices(db: DB, q: str = Query("", max_length=200), category_id: int | None = None,
            product_id: int | None = None, status: Status | None = None,
            page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100)):
-    stmt = select(PriceItem).join(Product)
-    if q.strip():
-        term = "%" + q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        stmt = stmt.where(or_(*[c.ilike(term, escape="\\") for c in
-                               [Product.name, PriceItem.material, PriceItem.spec, PriceItem.process]]))
-    if category_id is not None:
-        stmt = stmt.where(Product.category_id == category_id)
-    if product_id is not None:
-        stmt = stmt.where(PriceItem.product_id == product_id)
-    if status:
-        stmt = stmt.where(PriceItem.status == status)
-    total = db.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = db.scalars(stmt.order_by(PriceItem.id).offset((page - 1) * page_size).limit(page_size))
-    return {"items": [price_view(db, item) for item in rows], "total": total}
+    from .catalog_search import search_catalog
+    result = search_catalog(db, q, status=status, category_id=category_id, product_id=product_id)
+    rows = result.hits[(page - 1) * page_size:page * page_size]
+    return {"items": [price_view(db, hit.price) for hit in rows], "total": len(result.hits),
+            "search": result.audit()}
 
 
 @app.post("/api/prices", dependencies=AUTH, status_code=201)
 def create_price(data: PriceInput, db: DB):
     product = product_for(db, data.category, data.product)
     item = PriceItem(product_id=product.id, **data.model_dump(
-        exclude={"category", "product", "revision", "included_cost_kinds"}),
-        attributes={"included_cost_kinds": data.included_cost_kinds or []})
+        exclude={"category", "product", "revision", "included_cost_kinds", "catalog_contract"}),
+        attributes={"included_cost_kinds": data.included_cost_kinds or [],
+                    **(data.catalog_contract.model_dump() if data.catalog_contract else {})})
     db.add(item)
     log_change(db, item, "create", data.review_reason)
     db.commit()
@@ -179,10 +173,12 @@ def update_price(item_id: int, data: PriceInput, db: DB):
     before = snapshot(item)
     item.product_id = product_for(db, data.category, data.product).id
     for key, value in data.model_dump(
-            exclude={"category", "product", "revision", "included_cost_kinds"}).items():
+            exclude={"category", "product", "revision", "included_cost_kinds", "catalog_contract"}).items():
         setattr(item, key, value)
     if data.included_cost_kinds is not None:
         item.attributes = {**(item.attributes or {}), "included_cost_kinds": data.included_cost_kinds}
+    if data.catalog_contract is not None:
+        item.attributes = {**(item.attributes or {}), **data.catalog_contract.model_dump()}
     # Explicit increment also records a review which did not change the amount.
     item.revision += 1
     log_change(db, item, "update", data.review_reason, before)
@@ -215,15 +211,10 @@ def price_history(item_id: int, db: DB):
 @app.get("/api/rules", dependencies=AUTH)
 def rules(db: DB, q: str = Query("", max_length=200), status: Status | None = None,
           page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100)):
-    stmt = select(PricingRule)
-    if q:
-        stmt = stmt.where(or_(PricingRule.name.contains(q, autoescape=True),
-                             PricingRule.content.contains(q, autoescape=True)))
-    if status:
-        stmt = stmt.where(PricingRule.status == status)
-    total = db.scalar(select(func.count()).select_from(stmt.subquery()))
+    from .catalog_search import search_rules
+    total, rows = search_rules(db, q, (page - 1) * page_size, page_size, status=status)
     items = []
-    for r in db.scalars(stmt.order_by(PricingRule.id).offset((page - 1) * page_size).limit(page_size)):
+    for r in rows:
         item = snapshot(r)
         item["source"] = source_info(db, r.source_record_id, r.source_cell)
         item["product"] = db.get(Product, r.product_id).name if r.product_id else "公共 / 待归属"
@@ -321,3 +312,36 @@ def audit(db: DB, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, l
 from .requirements_api import router as requirements_router
 
 app.include_router(requirements_router, dependencies=AUTH)
+
+from .quote_maintenance import router as quote_maintenance_router
+
+app.include_router(quote_maintenance_router, dependencies=AUTH)
+
+
+@app.get("/api/health/ready")
+def readiness(db: DB):
+    from .worker_health import worker_status
+    status = worker_status(db)
+    return JSONResponse(status_code=200 if status["ready"] else 503, content=status)
+
+
+@app.get("/api/operations", dependencies=AUTH)
+def operations(db: DB):
+    from .worker_health import worker_status
+    return worker_status(db)
+
+
+@app.get("/api/quotation-contract", dependencies=AUTH)
+def quotation_contract():
+    from .pricing_contract import (
+        ENGINE_VERSION, WORKSPACE_VERSION, WORKFLOW_STATES, STATE_LABELS,
+        MAX_PARAMETER_BLOCKS, MAX_PARAMETER_FIELDS, MAX_COSTS,
+    )
+    from .process_taxonomy import PROCESS_LABELS
+    from .requirements_schemas import PARAMETER_FIELDS
+    return {"engine_version": ENGINE_VERSION, "workspace_version": WORKSPACE_VERSION,
+            "states": STATE_LABELS, "state_codes": WORKFLOW_STATES, "processes": PROCESS_LABELS,
+            "parameters": {key: sorted(values) for key, values in PARAMETER_FIELDS.items()},
+            "limits": {"parameter_blocks": MAX_PARAMETER_BLOCKS, "parameter_fields": MAX_PARAMETER_FIELDS,
+                       "compiled_assumptions": MAX_PARAMETER_BLOCKS * MAX_PARAMETER_FIELDS,
+                       "costs": MAX_COSTS}}

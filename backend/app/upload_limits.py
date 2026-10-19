@@ -1,28 +1,30 @@
 from starlette.responses import JSONResponse
 from starlette.exceptions import HTTPException
+from .config import settings
 
 
 class UploadTooLarge(HTTPException):
     def __init__(self):
-        super().__init__(413, "请求体超过允许大小（52MB）")
+        super().__init__(413, "请求体超过允许大小")
 
 
 class RequestSizeLimit:
     """Bound multipart bytes before Starlette spools uploaded files to disk."""
-    def __init__(self, app, max_bytes=52 * 1024 * 1024):
+    def __init__(self, app, max_bytes=None):
         self.app = app
         self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        max_bytes = self.max_bytes or settings().max_job_upload_bytes + 2 * 1024 * 1024
         headers = dict(scope.get("headers", []))
         length = headers.get(b"content-length")
         try:
-            too_large = length is not None and int(length) > self.max_bytes
+            too_large = length is not None and int(length) > max_bytes
         except ValueError:
             too_large = True
-        rejection = JSONResponse({"detail": "请求体超过允许大小（52MB）"}, status_code=413)
+        rejection = JSONResponse({"detail": f"请求体超过允许大小（{max_bytes // (1024 * 1024)}MB）"}, status_code=413)
         if too_large:
             return await rejection(scope, receive, send)
         size = 0
@@ -31,7 +33,7 @@ class RequestSizeLimit:
             nonlocal size
             message = await receive()
             size += len(message.get("body", b""))
-            if size > self.max_bytes:
+            if size > max_bytes:
                 raise UploadTooLarge()
             return message
 

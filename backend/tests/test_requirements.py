@@ -281,7 +281,8 @@ def test_csv_formula_injection():
 
 
 def test_request_envelope_limit(client):
-    response = client.post("/api/jobs", content=b"x", headers={"Content-Length": str(60 * 1024 * 1024)})
+    response = client.post("/api/jobs", content=b"x",
+                           headers={"Content-Length": str(settings().max_job_upload_bytes + 3 * 1024 * 1024)})
     assert response.status_code == 413
 
 

@@ -7,7 +7,7 @@ import redis
 from redis import ConnectionPool
 
 from .config import settings
-from .quote_engine import calculate_line
+from .quote_engine import calculate_requirements
 from .requirements_schemas import RequirementLine
 
 PUBLISH = """
@@ -45,14 +45,20 @@ def checkpoint_key(job_id):
 
 
 def save_checkpoint(db, job, run):
-    lines = [calculate_line(db, RequirementLine.model_validate(raw), automatic=True)
-             for raw in job.requirements]
+    if run.usage.get("extraction_input") and not run.usage.get("prepared"):
+        lines = [{"line_id": raw["id"], "product": raw["product"], "amount": None, "blockers": []}
+                 for raw in job.requirements]
+    else:
+        lines = calculate_requirements(db, job.requirements, automatic=True)
     amounts = [Decimal(line["amount"]) for line in lines if line["amount"] is not None]
+    from .source_reconciliation import source_review
+    review = source_review(job.extraction or {})
     metadata = {
         "job_id": job.id, "run_id": run.id, "revision": job.revision,
         "status": run.status, "priced_count": len(amounts), "line_count": len(lines),
         "known_subtotal": str(sum(amounts, Decimal(0))),
-        "complete": bool(lines) and all(line["amount"] is not None and not line["blockers"] for line in lines),
+        "complete": bool(lines) and not review["required"]
+            and all(line["amount"] is not None and not line["blockers"] for line in lines),
         "line_ids": [line["line_id"] for line in lines], "saved_at": time.time(),
     }
     values = {"metadata": json.dumps(metadata, ensure_ascii=False)}
@@ -66,8 +72,17 @@ def save_checkpoint(db, job, run):
     return metadata
 
 
-def read_checkpoint(job_id):
+def read_checkpoint(job_id, include_lines=False):
     client = redis_client()
     key = client.get(checkpoint_key(job_id))
+    if include_lines:
+        values = client.hgetall(key) if key else {}
+        if not values.get("metadata"):
+            return None
+        metadata = json.loads(values["metadata"])
+        lines = [json.loads(values[f"line:{identity}"]) for identity in metadata["line_ids"]]
+        if any(line["line_id"] != identity for identity, line in zip(metadata["line_ids"], lines)):
+            return None
+        return {**metadata, "lines": lines}
     raw = client.hget(key, "metadata") if key else None
     return json.loads(raw) if raw else None

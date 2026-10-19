@@ -29,6 +29,7 @@ def test_auth_error_requires_intervention_without_retry(client, monkeypatch, red
 
 
 def test_response_failure_budget_survives_cycles(client, monkeypatch, redis_worker):
+    monkeypatch.setattr(settings(), "agent_compact_plans", False)
     provider(monkeypatch, [])
     job = enqueue(client, monkeypatch, 1)
 
@@ -45,6 +46,54 @@ def test_response_failure_budget_survives_cycles(client, monkeypatch, redis_work
     assert run["status"] == "waiting"
     assert run["usage"]["total_tokens"] == 6
     assert not current["quotes"]
+
+
+def test_bad_response_on_one_line_does_not_stop_next_line(client, monkeypatch, redis_worker, test_db):
+    import json
+    provider(monkeypatch, [])
+    monkeypatch.setattr(settings(), "agent_compact_plans", True)
+    monkeypatch.setattr(settings(), "agent_slice_rounds", 1)
+    job = enqueue(client, monkeypatch, 2)
+    attempts = []
+
+    def respond(messages, tools):
+        active = json.loads(messages[1]["content"])["active_requirement"]
+        attempts.append(active["id"] if active else None)
+        if active and active["id"] == "line0":
+            raise deepseek.AgentResponseFailure("truncated_response", {}, {"total_tokens": 1})
+        return (call("complete_estimate", line_id="line1", estimate=plan())
+                if active else call("finish_pending_quote", reason="第一项响应异常，保留已完成第二项")), {}
+
+    monkeypatch.setattr(deepseek, "agent_turn", respond)
+    for _ in range(8):
+        agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    assert attempts.count("line0") == 3
+    assert current["requirements"][1]["estimate"]
+    with test_db() as db:
+        run = db.get(AgentRun, current["agent_runs"][0]["id"])
+        assert run.usage["work_state"]["line0"]["cause"] == "execution_error"
+        assert run.usage["work_state"]["line0"]["response_failures"] == 3
+
+
+def test_worker_saves_compact_plan_and_checkpoint(client, monkeypatch, redis_worker):
+    from app.agent_checkpoints import read_checkpoint
+    compact = {
+        "strategy": "area", "scope": "测试材料加工暂估，需审核",
+        "parameters": [{"target": "item", "values": {"quantity": 2}, "basis": "assumption",
+                        "reason": "测试样本暂定两件，待审核"}],
+        "costs": [{"label": "材料", "kind": "material", "measurement": "item_area",
+                   "rate": 100, "unit": "m2", "reason": "测试费率，非供应商确认价"}],
+    }
+    provider(monkeypatch, [call("submit_pricing_plan", line_id="line0", plan=compact),
+                           call("finish_quote")])
+    job = enqueue(client, monkeypatch, 1)
+    for _ in range(3):
+        agent_worker.run_pending_once(threading.Event())
+    current = client.get(f'/api/jobs/{job["id"]}').json()
+    assert current["requirements"][0]["estimate"]["contract_version"] == 3
+    assert current["quotes"][0]["payload"]["total"] == "7.20"
+    assert read_checkpoint(job["id"])["complete"]
 
 
 def test_transient_errors_backoff_and_stop(client, monkeypatch, redis_worker, test_db):
@@ -144,6 +193,8 @@ def test_progress_is_incremental_and_has_no_quote_history(client, monkeypatch):
     assert "quotes" not in progress and "requirements" not in progress
     assert progress["pricing_progress"]["priced_count"] == 1
     assert progress["pricing_progress"]["known_subtotal"] == "141.60"
+    assert progress["pricing_progress"]["lines"][0]["amount"] == "141.60"
+    assert "requirement" not in progress["pricing_progress"]["lines"][0]
     full = client.get(f'/api/jobs/{job["id"]}/agent-runs/{run["id"]}/steps/0')
     assert full.status_code == 200
     assert full.json()["arguments"]["estimate"]["scope"]

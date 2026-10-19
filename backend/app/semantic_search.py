@@ -181,8 +181,9 @@ def search_prices(db, query, material="", status="active", offset=0, check=lambd
         provider = Provider()
         statement = select(PriceItem, Product.name).join(Product)
         statement = statement.where(PriceItem.status != "inactive" if status == "all" else PriceItem.status == status)
-        if material:
-            statement = statement.where(PriceItem.material.contains(material, autoescape=True))
+        from .catalog_search import search_catalog, catalog_profile
+        eligible = search_catalog(db, material=material, status=status)
+        statement = statement.where(PriceItem.id.in_([hit.price.id for hit in eligible.hits]))
         records = db.execute(statement.order_by(PriceItem.id)).all()
         ids = [price.id for price, name in records]
         documents = [document(price, name) for price, name in records]
@@ -212,6 +213,7 @@ def search_prices(db, query, material="", status="active", offset=0, check=lambd
         page = candidates[offset:offset + 20]
         preload_sources(db, [price for (price, _), _ in page])
         prices = [{**snapshot(price), "product": name, "source": price_source(db, price),
+                   "catalog_profile": catalog_profile(price),
                    "similarity": round(score, 6)}
                   for (price, name), score in page]
         return {"prices": prices, "total": len(candidates),
